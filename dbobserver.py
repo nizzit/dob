@@ -222,50 +222,55 @@ def build_observation(
         return Observation(seed_table=table, seed_row=(), seed_cols=cols)
 
     obs = Observation(seed_table=table, seed_row=seed_row, seed_cols=cols)
-    row_dict = dict(zip(cols, seed_row))
 
-    # 1. FK from seed → parents
-    for fk in schema.fk_from.get(table, []):
-        fk_val = row_dict.get(fk.from_col)
-        if fk_val is None:
-            continue
-        r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val)
-        _merge(obs.related, fk.to_table, r_cols, r_rows)
+    # BFS по графу FK-связей.
+    # visited: set of (table, pk_col, pk_val) — предотвращает рекурсию.
+    # queue: list of (tbl, row_dict, cols) — строки, которые нужно раскрыть.
+    visited: set[tuple] = set()
+    queue: list[tuple[str, dict, list[str]]] = []
 
-    # 2. FK pointing to seed → children
-    for fk in schema.fk_to.get(table, []):
-        seed_val = row_dict.get(fk.to_col)
-        if seed_val is None:
-            seed_val = pk_val if pk_col == fk.to_col else None
-        if seed_val is None:
-            continue
-        r_cols, r_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, seed_val)
-        _merge(obs.related, fk.from_table, r_cols, r_rows)
+    seed_dict = dict(zip(cols, seed_row))
+    visited.add((table, pk_col, pk_val))
+    queue.append((table, seed_dict, cols))
 
-    # 3. One level deeper: neighbours of related rows (both directions)
-    for rel_table, (r_cols, r_rows) in list(obs.related.items()):
-        for r_row in r_rows:
-            r_dict = dict(zip(r_cols, r_row))
+    while queue:
+        cur_table, cur_dict, cur_cols = queue.pop(0)
 
-            # 3a. parents: rel_table.col → other_table.col
-            for fk in schema.fk_from.get(rel_table, []):
-                if fk.to_table == table:
-                    continue
-                fk_val = r_dict.get(fk.from_col)
-                if fk_val is None:
-                    continue
-                p_cols, p_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val)
-                _merge(obs.related, fk.to_table, p_cols, p_rows)
+        # ── FK from cur_table → parent tables ──────────────────────────
+        for fk in schema.fk_from.get(cur_table, []):
+            fk_val = cur_dict.get(fk.from_col)
+            if fk_val is None:
+                continue
+            r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val)
+            _merge(obs.related, fk.to_table, r_cols, r_rows)
+            # enqueue newly discovered rows
+            for r_row in r_rows:
+                r_pk_col = get_pk_column(conn, fk.to_table) or r_cols[0]
+                r_dict = dict(zip(r_cols, r_row))
+                r_pk_val = r_dict.get(r_pk_col, r_row[0])
+                key = (fk.to_table, r_pk_col, r_pk_val)
+                if key not in visited:
+                    visited.add(key)
+                    queue.append((fk.to_table, r_dict, r_cols))
 
-            # 3b. children: other_table.col → rel_table.col
-            for fk in schema.fk_to.get(rel_table, []):
-                if fk.from_table == table:
-                    continue
-                seed_val = r_dict.get(fk.to_col)
-                if seed_val is None:
-                    continue
-                c_cols, c_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, seed_val)
-                _merge(obs.related, fk.from_table, c_cols, c_rows)
+        # ── FK pointing to cur_table → child tables ─────────────────────
+        for fk in schema.fk_to.get(cur_table, []):
+            ref_val = cur_dict.get(fk.to_col)
+            if ref_val is None:
+                continue
+            r_cols, r_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, ref_val)
+            _merge(obs.related, fk.from_table, r_cols, r_rows)
+            for r_row in r_rows:
+                r_pk_col = get_pk_column(conn, fk.from_table) or r_cols[0]
+                r_dict = dict(zip(r_cols, r_row))
+                r_pk_val = r_dict.get(r_pk_col, r_row[0])
+                key = (fk.from_table, r_pk_col, r_pk_val)
+                if key not in visited:
+                    visited.add(key)
+                    queue.append((fk.from_table, r_dict, r_cols))
+
+    # seed не должен дублироваться в related
+    obs.related.pop(table, None)
 
     return obs
 
