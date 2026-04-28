@@ -566,22 +566,21 @@ class RowPickerScreen(Screen):
         self.pk_col = get_pk_column(conn, table)
         self.cols, self.rows = fetch_all_rows(conn, table)
 
+    def on_mount(self) -> None:
+        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
+        self.query_one("#row-table", DataTable).focus()
+
+    def on_unmount(self) -> None:
+        self.app.sub_title = ""
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
-        with Vertical():
-            yield Label(
-                f"[bold]Table:[/] [cyan]{self.table}[/]  —  pick a row  (Enter = observe, L = live observe)",
-                classes="screen-title",
-            )
-            dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="row")
-            dt.add_columns(*self.cols)
-            for row in self.rows:
-                dt.add_row(*[_fmt(v) for v in row], key=str(row))
-            yield dt
-
-    def on_mount(self) -> None:
-        self.query_one("#row-table", DataTable).focus()
+        dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="row")
+        dt.add_columns(*self.cols)
+        for row in self.rows:
+            dt.add_row(*[_fmt(v) for v in row], key=str(row))
+        yield dt
 
     @on(DataTable.RowSelected, "#row-table")
     def row_selected(self, event: DataTable.RowSelected) -> None:
@@ -718,6 +717,12 @@ DataTable {
     height: auto;
     max-height: 12;
     margin-bottom: 1;
+}
+
+#row-table {
+    height: 1fr;
+    max-height: 100%;
+    margin-bottom: 0;
 }
 
 ExpandedTableScreen {
