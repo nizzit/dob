@@ -570,6 +570,7 @@ class ObservationScreen(Screen):
         Binding("escape,q", "app.pop_screen", "Back"),
         Binding("l",        "toggle_live",    "Live",   show=True),
         Binding("f",        "expand_focused", "Expand", show=True),
+        Binding("k",        "link",           "Link cols", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
@@ -649,6 +650,52 @@ class ObservationScreen(Screen):
             if self._timer:
                 self._timer.stop()
                 self._timer = None
+
+    def action_link(self) -> None:
+        """Open LinkBuilderScreen to define a virtual FK for the seed table."""
+        db_path = self._schema.db_path
+        if not db_path:
+            return
+
+        def on_result(saved: bool) -> None:
+            if saved:
+                VirtualLinks.inject(self._schema)
+                # rebuild observation so new linked rows appear immediately
+                self._obs = build_observation(
+                    self._conn, self._schema,
+                    self._table, self._pk_col, self._pk_val,
+                )
+                self.notify(
+                    f"Link saved — rebuilding observation",
+                    title="Virtual link created",
+                )
+                # reload the observation blocks
+                self._rebuild_blocks()
+
+        self.app.push_screen(
+            LinkBuilderScreen(
+                db_path=db_path,
+                schema=self._schema,
+                from_table=self._table,
+                cols=self._obs.seed_cols,
+            ),
+            on_result,
+        )
+
+    def _rebuild_blocks(self) -> None:
+        """Mount blocks for tables that appeared after a schema change."""
+        scroll: VerticalScroll = self.query_one("#obs-scroll")
+        obs = self._obs
+        for tbl_name, (cols, rows) in obs.related.items():
+            if tbl_name in self._blocks:
+                continue   # already displayed
+            bid = tbl_name
+            blk = TableBlock(
+                table=tbl_name, cols=cols, rows=rows,
+                is_seed=False, id=f"block-{bid}", classes="obs-block",
+            )
+            self._blocks[bid] = blk
+            scroll.mount(blk)
 
     def on_mount(self) -> None:
         self.watch_live(False)   # set initial status label
@@ -748,7 +795,6 @@ class RowPickerScreen(Screen):
     BINDINGS = [
         Binding("escape,q", "app.pop_screen", "Back"),
         Binding("r",        "refresh",        "Refresh"),
-        Binding("k",        "link",           "Link cols", show=True),
     ]
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, table: str) -> None:
@@ -772,31 +818,6 @@ class RowPickerScreen(Screen):
     def action_refresh(self) -> None:
         self._reload()
         self.query_one("#row-table", DataTable).focus()
-
-    def action_link(self) -> None:
-        """Open LinkBuilderScreen to define a virtual FK for this table."""
-        db_path = self.schema.db_path
-        if not db_path:
-            return
-
-        def on_result(saved: bool) -> None:
-            if saved:
-                # reload schema with new virtual link injected
-                VirtualLinks.inject(self.schema)
-                self.notify(
-                    f"Link saved to {Path(db_path).with_suffix('.links.json').name}",
-                    title="Virtual link created",
-                )
-
-        self.app.push_screen(
-            LinkBuilderScreen(
-                db_path=db_path,
-                schema=self.schema,
-                from_table=self.table,
-                cols=self.cols,
-            ),
-            on_result,
-        )
 
     def on_mount(self) -> None:
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
