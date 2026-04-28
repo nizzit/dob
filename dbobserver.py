@@ -556,7 +556,10 @@ class ObservationScreen(Screen):
 class RowPickerScreen(Screen):
     """Pick a row from a table."""
 
-    BINDINGS = [Binding("escape,q", "app.pop_screen", "Back")]
+    BINDINGS = [
+        Binding("escape,q", "app.pop_screen", "Back"),
+        Binding("r",        "refresh",        "Refresh"),
+    ]
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, table: str) -> None:
         super().__init__()
@@ -565,6 +568,20 @@ class RowPickerScreen(Screen):
         self.table  = table
         self.pk_col = get_pk_column(conn, table)
         self.cols, self.rows = fetch_all_rows(conn, table)
+
+    def _reload(self) -> None:
+        self.cols, self.rows = fetch_all_rows(self.conn, self.table)
+        dt = self.query_one("#row-table", DataTable)
+        cur = dt.cursor_row
+        dt.clear()
+        for row in self.rows:
+            dt.add_row(*[_fmt(v) for v in row], key=str(row))
+        dt.move_cursor(row=min(cur, max(0, len(self.rows) - 1)))
+        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
+
+    def action_refresh(self) -> None:
+        self._reload()
+        self.query_one("#row-table", DataTable).focus()
 
     def on_mount(self) -> None:
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
