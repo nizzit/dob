@@ -251,8 +251,6 @@ def build_observation(
             for fk in schema.fk_from.get(rel_table, []):
                 if fk.to_table == table:
                     continue
-                if fk.to_table in obs.related:
-                    continue   # already collected
                 fk_val = r_dict.get(fk.from_col)
                 if fk_val is None:
                     continue
@@ -263,8 +261,6 @@ def build_observation(
             for fk in schema.fk_to.get(rel_table, []):
                 if fk.from_table == table:
                     continue
-                if fk.from_table in obs.related:
-                    continue   # already collected
                 seed_val = r_dict.get(fk.to_col)
                 if seed_val is None:
                     continue
