@@ -716,22 +716,57 @@ class ObservationScreen(Screen):
 
     # ── expand ───────────────────────────────
 
+    # ── helpers ──────────────────────────────
+
+    def _block_for_widget(self, widget) -> TableBlock | None:
+        """Walk up the DOM from widget to find its parent TableBlock."""
+        node = widget
+        while node is not None:
+            if isinstance(node, TableBlock):
+                return node
+            node = node.parent
+        return None
+
+    # ── drill-down on row select ──────────────
+
+    @on(DataTable.RowSelected)
+    def row_drilldown(self, event: DataTable.RowSelected) -> None:
+        """Open a new ObservationScreen for the selected row."""
+        block = self._block_for_widget(event.data_table)
+        if block is None:
+            return
+
+        # seed block uses cursor_type="row" but we don't drill into itself
+        if block.is_seed:
+            return
+
+        row_index = event.cursor_row
+        if row_index >= len(block.all_rows):
+            return
+
+        raw_row  = block.all_rows[row_index]
+        row_dict = dict(zip(block.cols, raw_row))
+        pk_col   = get_pk_column(self._conn, block.tbl_name) or block.cols[0]
+        pk_val   = row_dict.get(pk_col, raw_row[0])
+
+        self.app.push_screen(
+            ObservationScreen(
+                self._conn, self._schema,
+                block.tbl_name, pk_col, pk_val,
+            )
+        )
+
+    # ── expand ───────────────────────────────
+
     def action_expand_focused(self) -> None:
         """Open the currently-focused DataTable in full-screen modal."""
-        # find which block's DataTable has focus (or just take the first one)
         focused = self.focused
-        target_block: TableBlock | None = None
+        target_block = (
+            self._block_for_widget(focused)
+            if isinstance(focused, DataTable) else None
+        )
 
-        if isinstance(focused, DataTable):
-            # walk up to find parent TableBlock
-            node = focused.parent
-            while node is not None:
-                if isinstance(node, TableBlock):
-                    target_block = node
-                    break
-                node = node.parent
-
-        # fallback: expand whichever block is under scroll offset (first one)
+        # fallback: first block
         if target_block is None and self._blocks:
             target_block = next(iter(self._blocks.values()))
 
