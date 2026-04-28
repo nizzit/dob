@@ -9,3 +9,4 @@ wheels/
 # Virtual environments
 .venv
 test.db
+*.db-shm\n*.db-wal\n*.db-journal
