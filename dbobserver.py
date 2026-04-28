@@ -12,6 +12,7 @@ Flow:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -49,21 +50,30 @@ class FKInfo:
     from_col: str
     to_table: str
     to_col: str
+    virtual: bool = False   # True — вручную заданная связь
 
 
 @dataclass
 class Schema:
     tables: list[str]
-    fk_from: dict[str, list[FKInfo]] = field(default_factory=dict)
-    fk_to:   dict[str, list[FKInfo]] = field(default_factory=dict)
+    fk_from:   dict[str, list[FKInfo]] = field(default_factory=dict)
+    fk_to:     dict[str, list[FKInfo]] = field(default_factory=dict)
+    db_path:   str = ""                 # путь к .db для VirtualLinks
+    col_cache: dict[str, list[str]] = field(default_factory=dict)  # table→cols
 
 
-def load_schema(conn: sqlite3.Connection) -> Schema:
+def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
     cur = conn.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
     tables = [r[0] for r in cur.fetchall() if not r[0].startswith("sqlite_")]
 
-    schema = Schema(tables=tables)
+    schema = Schema(tables=tables, db_path=db_path)
+
+    # cache column names for each table
+    for table in tables:
+        cur.execute(f'SELECT * FROM "{table}" LIMIT 0')
+        schema.col_cache[table] = [d[0] for d in cur.description]
+
     for table in tables:
         schema.fk_from[table] = []
         cur.execute(f"PRAGMA foreign_key_list('{table}')")
@@ -77,6 +87,9 @@ def load_schema(conn: sqlite3.Connection) -> Schema:
     for table in tables:
         for fk in schema.fk_from[table]:
             schema.fk_to[fk.to_table].append(fk)
+
+    # inject user-defined virtual links
+    VirtualLinks.inject(schema)
 
     return schema
 
@@ -113,6 +126,74 @@ def fetch_related_rows(
     cur.execute(f'SELECT * FROM "{table}" WHERE "{fk_col}" = ?', (fk_val,))
     cols = [d[0] for d in cur.description]
     return cols, cur.fetchall()
+
+
+# ─────────────────────────────────────────────
+# Virtual links (user-defined pseudo-FK)
+# ─────────────────────────────────────────────
+
+class VirtualLinks:
+    """
+    Persists user-defined column→column links in <db>.links.json.
+    Format: list of {from_table, from_col, to_table, to_col}
+    """
+
+    @staticmethod
+    def _path(db_path: str) -> Path:
+        return Path(db_path).with_suffix(".links.json")
+
+    @classmethod
+    def load(cls, db_path: str) -> list[dict]:
+        p = cls._path(db_path)
+        if not p.exists():
+            return []
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return []
+
+    @classmethod
+    def save(cls, db_path: str, links: list[dict]) -> None:
+        cls._path(db_path).write_text(json.dumps(links, indent=2))
+
+    @classmethod
+    def add(cls, db_path: str, from_table: str, from_col: str,
+            to_table: str, to_col: str) -> None:
+        links = cls.load(db_path)
+        entry = dict(from_table=from_table, from_col=from_col,
+                     to_table=to_table,   to_col=to_col)
+        if entry not in links:
+            links.append(entry)
+            cls.save(db_path, links)
+
+    @classmethod
+    def remove(cls, db_path: str, from_table: str, from_col: str,
+               to_table: str, to_col: str) -> None:
+        links = cls.load(db_path)
+        entry = dict(from_table=from_table, from_col=from_col,
+                     to_table=to_table,   to_col=to_col)
+        links = [ln for ln in links if ln != entry]
+        cls.save(db_path, links)
+
+    @classmethod
+    def inject(cls, schema: Schema) -> None:
+        """Add virtual FKInfo entries to an already-loaded Schema in-place."""
+        if not schema.db_path:
+            return
+        for entry in cls.load(schema.db_path):
+            ft, fc = entry["from_table"], entry["from_col"]
+            tt, tc = entry["to_table"],   entry["to_col"]
+            if ft not in schema.fk_from:
+                schema.fk_from[ft] = []
+            if tt not in schema.fk_to:
+                schema.fk_to[tt] = []
+            fk = FKInfo(from_table=ft, from_col=fc,
+                        to_table=tt,  to_col=tc, virtual=True)
+            existing = {(f.from_col, f.to_table, f.to_col)
+                        for f in schema.fk_from[ft]}
+            if (fc, tt, tc) not in existing:
+                schema.fk_from[ft].append(fk)
+                schema.fk_to[tt].append(fk)
 
 
 # ─────────────────────────────────────────────
@@ -332,6 +413,114 @@ class TableBlock(Static):
         self._lbl().update(
             f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{new_tag}"
         )
+
+
+# ─────────────────────────────────────────────
+# Link builder modal
+# ─────────────────────────────────────────────
+
+class LinkBuilderScreen(ModalScreen[bool]):
+    """
+    Three-step wizard to create a virtual FK link:
+      Step 1 — pick source column
+      Step 2 — pick target table
+      Step 3 — pick target column
+    Saves via VirtualLinks.add() and dismisses(True) on success.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel")]
+
+    def __init__(
+        self,
+        db_path:    str,
+        schema:     Schema,
+        from_table: str,
+        cols:       list[str],
+    ) -> None:
+        super().__init__()
+        self._db_path    = db_path
+        self._schema     = schema
+        self._from_table = from_table
+        self._cols       = cols
+        self._from_col:     str | None = None
+        self._target_table: str | None = None
+        self._step = 1
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield Label("", id="link-heading")
+        yield ListView(id="link-list")
+        yield Label("[dim]Enter — select │ Esc — cancel[/dim]", id="link-hint")
+
+    def on_mount(self) -> None:
+        self._render_step()
+
+    # ── rendering ───────────────────────────
+
+    def _render_step(self) -> None:
+        lv: ListView = self.query_one("#link-list", ListView)
+        lv.clear()
+        heading: Label = self.query_one("#link-heading", Label)
+
+        if self._step == 1:
+            heading.update(
+                f"[bold cyan]Link builder[/] — "
+                f"[bold]{self._from_table}[/] → ? "
+                f"[dim]Step 1 of 3: pick source column[/dim]"
+            )
+            for col in self._cols:
+                # mark already-linked columns
+                has = any(
+                    fk.from_col == col and fk.virtual
+                    for fk in self._schema.fk_from.get(self._from_table, [])
+                )
+                badge = "  [dim green](✓ linked)[/dim green]" if has else ""
+                lv.append(ListItem(Label(f"[yellow]{col}[/]{badge}"), name=col))
+
+        elif self._step == 2:
+            heading.update(
+                f"[bold cyan]Link builder[/] — "
+                f"[bold]{self._from_table}.{self._from_col}[/] → ? "
+                f"[dim]Step 2 of 3: pick target table[/dim]"
+            )
+            for tbl in self._schema.tables:
+                if tbl == self._from_table:
+                    continue
+                lv.append(ListItem(Label(f"[cyan]{tbl}[/]"), name=tbl))
+
+        elif self._step == 3:
+            heading.update(
+                f"[bold cyan]Link builder[/] — "
+                f"[bold]{self._from_table}.{self._from_col}[/] → "
+                f"[bold]{self._target_table}[/].[?] "
+                f"[dim]Step 3 of 3: pick target column[/dim]"
+            )
+            for col in self._schema.col_cache.get(self._target_table, []):
+                lv.append(ListItem(Label(f"[yellow]{col}[/]"), name=col))
+
+        lv.focus()
+
+    # ── events ────────────────────────────
+
+    @on(ListView.Selected, "#link-list")
+    def item_selected(self, event: ListView.Selected) -> None:
+        name = event.item.name
+        if self._step == 1:
+            self._from_col = name
+            self._step = 2
+            self._render_step()
+        elif self._step == 2:
+            self._target_table = name
+            self._step = 3
+            self._render_step()
+        elif self._step == 3:
+            VirtualLinks.add(
+                self._db_path,
+                self._from_table, self._from_col,
+                self._target_table, name,
+            )
+            self.dismiss(True)
 
 
 # ─────────────────────────────────────────────
@@ -559,6 +748,7 @@ class RowPickerScreen(Screen):
     BINDINGS = [
         Binding("escape,q", "app.pop_screen", "Back"),
         Binding("r",        "refresh",        "Refresh"),
+        Binding("k",        "link",           "Link cols", show=True),
     ]
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, table: str) -> None:
@@ -582,6 +772,31 @@ class RowPickerScreen(Screen):
     def action_refresh(self) -> None:
         self._reload()
         self.query_one("#row-table", DataTable).focus()
+
+    def action_link(self) -> None:
+        """Open LinkBuilderScreen to define a virtual FK for this table."""
+        db_path = self.schema.db_path
+        if not db_path:
+            return
+
+        def on_result(saved: bool) -> None:
+            if saved:
+                # reload schema with new virtual link injected
+                VirtualLinks.inject(self.schema)
+                self.notify(
+                    f"Link saved to {Path(db_path).with_suffix('.links.json').name}",
+                    title="Virtual link created",
+                )
+
+        self.app.push_screen(
+            LinkBuilderScreen(
+                db_path=db_path,
+                schema=self.schema,
+                from_table=self.table,
+                cols=self.cols,
+            ),
+            on_result,
+        )
 
     def on_mount(self) -> None:
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
@@ -684,7 +899,7 @@ class OpenDBScreen(Screen):
             # WAL mode + check_same_thread=False so timer thread can read
             conn = sqlite3.connect(str(p), check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
-            schema = load_schema(conn)
+            schema = load_schema(conn, db_path=str(p))
             self.app.push_screen(TablePickerScreen(conn, schema, str(p)))
         except Exception as exc:
             err.update(f"[red]Error: {exc}[/red]")
@@ -759,6 +974,27 @@ ExpandedTableScreen DataTable {
 
 #error-label {
     color: $error;
+}
+
+LinkBuilderScreen {
+    align: center middle;
+}
+
+LinkBuilderScreen #link-heading {
+    margin: 0 2 1 2;
+    height: 1;
+}
+
+LinkBuilderScreen ListView {
+    width: 80;
+    height: 1fr;
+    max-height: 30;
+    border: solid $primary;
+}
+
+LinkBuilderScreen #link-hint {
+    margin: 1 2 0 2;
+    height: 1;
 }
 """
 
