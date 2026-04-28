@@ -23,7 +23,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.reactive import reactive
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import (
     DataTable,
@@ -271,7 +271,7 @@ class TableBlock(Static):
             f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]",
             id=f"lbl-{self.id}",
         )
-        dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="none")
+        dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="row")
         dt.add_columns(*self.cols)
         for row in self.all_rows:
             dt.add_row(*_row_strs(row))
@@ -335,6 +335,42 @@ class TableBlock(Static):
 
 
 # ─────────────────────────────────────────────
+# Expanded (fullscreen) table modal
+# ─────────────────────────────────────────────
+
+class ExpandedTableScreen(ModalScreen):
+    """Full-screen view of a single table. Esc to close."""
+
+    BINDINGS = [Binding("escape,q,f", "dismiss", "Close")]
+
+    def __init__(self, title: str, cols: list[str], rows: list[tuple]) -> None:
+        super().__init__()
+        self._title = title
+        self._cols  = cols
+        self._rows  = rows
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield Label(
+            f"[bold cyan]{self._title}[/]  [dim]{len(self._rows)} rows — Esc / F to close[/dim]",
+            id="expanded-title",
+        )
+        dt = DataTable(
+            id="expanded-dt",
+            zebra_stripes=True,
+            cursor_type="row",
+        )
+        dt.add_columns(*self._cols)
+        for row in self._rows:
+            dt.add_row(*_row_strs(row))
+        yield dt
+
+    def on_mount(self) -> None:
+        self.query_one("#expanded-dt", DataTable).focus()
+
+
+# ─────────────────────────────────────────────
 # Screens
 # ─────────────────────────────────────────────
 
@@ -343,7 +379,8 @@ class ObservationScreen(Screen):
 
     BINDINGS = [
         Binding("escape,q", "app.pop_screen", "Back"),
-        Binding("l",        "toggle_live",    "Live", show=True),
+        Binding("l",        "toggle_live",    "Live",   show=True),
+        Binding("f",        "expand_focused", "Expand", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
@@ -426,6 +463,40 @@ class ObservationScreen(Screen):
 
     def on_mount(self) -> None:
         self.watch_live(False)   # set initial status label
+        # give keyboard focus to scroll container so arrow keys work
+        self.query_one("#obs-scroll").focus()
+
+    # ── expand ───────────────────────────────
+
+    def action_expand_focused(self) -> None:
+        """Open the currently-focused DataTable in full-screen modal."""
+        # find which block's DataTable has focus (or just take the first one)
+        focused = self.focused
+        target_block: TableBlock | None = None
+
+        if isinstance(focused, DataTable):
+            # walk up to find parent TableBlock
+            node = focused.parent
+            while node is not None:
+                if isinstance(node, TableBlock):
+                    target_block = node
+                    break
+                node = node.parent
+
+        # fallback: expand whichever block is under scroll offset (first one)
+        if target_block is None and self._blocks:
+            target_block = next(iter(self._blocks.values()))
+
+        if target_block is None:
+            return
+
+        self.app.push_screen(
+            ExpandedTableScreen(
+                title=target_block.tbl_name,
+                cols=list(target_block.cols),
+                rows=list(target_block.all_rows),
+            )
+        )
 
     # ── poll ─────────────────────────────────
 
@@ -645,8 +716,23 @@ Input {
 
 DataTable {
     height: auto;
-    max-height: 20;
+    max-height: 12;
     margin-bottom: 1;
+}
+
+ExpandedTableScreen {
+    align: center middle;
+}
+
+#expanded-title {
+    margin: 0 2 0 2;
+    height: 1;
+}
+
+ExpandedTableScreen DataTable {
+    width: 100%;
+    height: 1fr;
+    max-height: 100%;
 }
 
 #error-label {
