@@ -242,18 +242,34 @@ def build_observation(
         r_cols, r_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, seed_val)
         _merge(obs.related, fk.from_table, r_cols, r_rows)
 
-    # 3. One level deeper: parents of related rows
+    # 3. One level deeper: neighbours of related rows (both directions)
     for rel_table, (r_cols, r_rows) in list(obs.related.items()):
         for r_row in r_rows:
             r_dict = dict(zip(r_cols, r_row))
+
+            # 3a. parents: rel_table.col → other_table.col
             for fk in schema.fk_from.get(rel_table, []):
                 if fk.to_table == table:
                     continue
+                if fk.to_table in obs.related:
+                    continue   # already collected
                 fk_val = r_dict.get(fk.from_col)
                 if fk_val is None:
                     continue
                 p_cols, p_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val)
                 _merge(obs.related, fk.to_table, p_cols, p_rows)
+
+            # 3b. children: other_table.col → rel_table.col
+            for fk in schema.fk_to.get(rel_table, []):
+                if fk.from_table == table:
+                    continue
+                if fk.from_table in obs.related:
+                    continue   # already collected
+                seed_val = r_dict.get(fk.to_col)
+                if seed_val is None:
+                    continue
+                c_cols, c_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, seed_val)
+                _merge(obs.related, fk.from_table, c_cols, c_rows)
 
     return obs
 
