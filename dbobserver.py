@@ -1,5 +1,5 @@
 """
-DbObserver — minimal SQLite relationship explorer.
+DbObserver - minimal SQLite relationship explorer.
 
 Flow:
   1. Open a .db file (passed as CLI arg or entered in the app)
@@ -50,7 +50,7 @@ class FKInfo:
     from_col: str
     to_table: str
     to_col: str
-    virtual: bool = False   # True — вручную заданная связь
+    virtual: bool = False   # True - вручную заданная связь
 
 
 @dataclass
@@ -117,6 +117,13 @@ def get_pk_column(conn: sqlite3.Connection, table: str) -> str | None:
         if row[5] == 1:
             return row[1]
     return None
+
+
+def get_pk_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return all PK column names for a table (composite PK support)."""
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info('{table}')")
+    return {row[1] for row in cur.fetchall() if row[5] > 0}
 
 
 def fetch_related_rows(
@@ -224,8 +231,8 @@ def build_observation(
     obs = Observation(seed_table=table, seed_row=seed_row, seed_cols=cols)
 
     # BFS по графу FK-связей.
-    # visited: set of (table, pk_col, pk_val) — предотвращает рекурсию.
-    # queue: list of (tbl, row_dict, cols) — строки, которые нужно раскрыть.
+    # visited: set of (table, pk_col, pk_val) - предотвращает рекурсию.
+    # queue: list of (tbl, row_dict, cols) - строки, которые нужно раскрыть.
     visited: set[tuple] = set()
     queue: list[tuple[str, dict, list[str]]] = []
 
@@ -345,6 +352,53 @@ def _row_strs(row: tuple) -> list[str]:
     return [_fmt(v) for v in row]
 
 
+def _build_col_meta(
+    conn: sqlite3.Connection,
+    schema: Schema,
+    table: str,
+) -> tuple[set[str], dict[str, FKInfo]]:
+    """Return (pk_cols, fk_cols) for a table.
+
+    pk_cols - set of PK column names.
+    fk_cols - mapping col_name → FKInfo for columns that participate in any FK
+              (real or virtual) originating from this table.
+    """
+    pk_cols = get_pk_columns(conn, table)
+    fk_cols: dict[str, FKInfo] = {}
+    for fk in schema.fk_from.get(table, []):
+        # if a column already has a real FK, don't overwrite with virtual
+        if fk.from_col not in fk_cols or fk.virtual is False:
+            fk_cols[fk.from_col] = fk
+    return pk_cols, fk_cols
+
+
+def _col_header(col: str, pk_cols: set[str], fk_cols: dict[str, FKInfo]) -> str:
+    """
+    Return a column header string with relationship indicators:
+      🔑 Primary key
+      🔗 Real FK to another table
+      ✨ Virtual (user-defined) link
+    Multiple indicators are stacked (e.g. 🔑🔗 for FK that is also PK).
+    """
+    if col in pk_cols:
+        pk_prefix = "[bold yellow]*[/bold yellow]"
+    else:
+        pk_prefix = ""
+
+    if col in fk_cols:
+        fk = fk_cols[col]
+        if fk.virtual:
+            fk_prefix = "[#b57ed6]~[/#b57ed6]"
+        else:
+            fk_prefix = "[bold cyan]→[/bold cyan]"
+    else:
+        fk_prefix = ""
+
+    if pk_prefix or fk_prefix:
+        return f"{pk_prefix}{fk_prefix}{col}"
+    return col
+
+
 class TableBlock(Static):
     """
     One table section: header label + DataTable.
@@ -352,12 +406,17 @@ class TableBlock(Static):
     """
 
     def __init__(self, table: str, cols: list[str], rows: list[tuple],
-                 is_seed: bool = False, **kwargs) -> None:
+                 is_seed: bool = False,
+                 pk_cols: set[str] | None = None,
+                 fk_cols: dict[str, FKInfo] | None = None,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
         self.tbl_name  = table
         self.cols      = cols
         self.all_rows  = list(rows)
         self.is_seed   = is_seed
+        self._pk_cols: set[str]          = pk_cols or set()
+        self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         # row_key → flash countdown (ticks remaining)
         self._flash: dict[str, int] = {}
 
@@ -369,8 +428,9 @@ class TableBlock(Static):
             f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]",
             id=f"lbl-{self.id}",
         )
-        dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="row")
-        dt.add_columns(*self.cols)
+        dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="cell")
+        headers = [_col_header(c, self._pk_cols, self._fk_cols) for c in self.cols]
+        dt.add_columns(*headers)
         for row in self.all_rows:
             dt.add_row(*_row_strs(row))
         yield dt
@@ -389,7 +449,7 @@ class TableBlock(Static):
             key = f"new-{id(row)}"
             dt.add_row(*_row_strs(row), key=key)
             self._flash[key] = 3          # будет убран через 3 тика (~6 сек)
-            # подсветка через стиль строки не поддерживается в Textual напрямую —
+            # подсветка через стиль строки не поддерживается в Textual напрямую -
             # добавляем маркер в первую ячейку
             self._mark_row(dt, key, new=True)
 
@@ -438,10 +498,10 @@ class TableBlock(Static):
 
 class LinkBuilderScreen(ModalScreen[bool]):
     """
-    Three-step wizard to create a virtual FK link:
-      Step 1 — pick source column
-      Step 2 — pick target table
-      Step 3 — pick target column
+    Two-step wizard to create a virtual FK link.
+    Source table+column are already known (selected cell on ObservationScreen).
+      Step 1 - pick target table
+      Step 2 - pick target column
     Saves via VirtualLinks.add() and dismisses(True) on success.
     """
 
@@ -452,14 +512,13 @@ class LinkBuilderScreen(ModalScreen[bool]):
         db_path:    str,
         schema:     Schema,
         from_table: str,
-        cols:       list[str],
+        from_col:   str,
     ) -> None:
         super().__init__()
         self._db_path    = db_path
         self._schema     = schema
         self._from_table = from_table
-        self._cols       = cols
-        self._from_col:     str | None = None
+        self._from_col   = from_col
         self._target_table: str | None = None
         self._step = 1
 
@@ -468,7 +527,7 @@ class LinkBuilderScreen(ModalScreen[bool]):
         yield Footer()
         yield Label("", id="link-heading")
         yield ListView(id="link-list")
-        yield Label("[dim]Enter — select │ Esc — cancel[/dim]", id="link-hint")
+        yield Label("[dim]Enter - select │ Esc - cancel[/dim]", id="link-hint")
 
     def on_mount(self) -> None:
         self._render_step()
@@ -482,39 +541,31 @@ class LinkBuilderScreen(ModalScreen[bool]):
 
         if self._step == 1:
             heading.update(
-                f"[bold cyan]Link builder[/] — "
-                f"[bold]{self._from_table}[/] → ? "
-                f"[dim]Step 1 of 3: pick source column[/dim]"
-            )
-            for col in self._cols:
-                # mark already-linked columns
-                has = any(
-                    fk.from_col == col and fk.virtual
-                    for fk in self._schema.fk_from.get(self._from_table, [])
-                )
-                badge = "  [dim green](✓ linked)[/dim green]" if has else ""
-                lv.append(ListItem(Label(f"[yellow]{col}[/]{badge}"), name=col))
-
-        elif self._step == 2:
-            heading.update(
-                f"[bold cyan]Link builder[/] — "
-                f"[bold]{self._from_table}.{self._from_col}[/] → ? "
-                f"[dim]Step 2 of 3: pick target table[/dim]"
+                f"[bold cyan]Link builder[/] - "
+                f"[bold]{self._from_table}[/].[bold yellow]{self._from_col}[/] → ? "
+                f"[dim]Step 1 of 2: pick target table[/dim]"
             )
             for tbl in self._schema.tables:
                 if tbl == self._from_table:
                     continue
                 lv.append(ListItem(Label(f"[cyan]{tbl}[/]"), name=tbl))
 
-        elif self._step == 3:
+        elif self._step == 2:
+            # mark columns that are already a target of a link from this source
+            existing_targets = {
+                (fk.to_table, fk.to_col)
+                for fk in self._schema.fk_from.get(self._from_table, [])
+                if fk.virtual and fk.from_col == self._from_col
+            }
             heading.update(
-                f"[bold cyan]Link builder[/] — "
-                f"[bold]{self._from_table}.{self._from_col}[/] → "
-                f"[bold]{self._target_table}[/].[?] "
-                f"[dim]Step 3 of 3: pick target column[/dim]"
+                f"[bold cyan]Link builder[/] - "
+                f"[bold]{self._from_table}[/].[bold yellow]{self._from_col}[/] → "
+                f"[bold cyan]{self._target_table}[/].[?] "
+                f"[dim]Step 2 of 2: pick target column[/dim]"
             )
             for col in self._schema.col_cache.get(self._target_table, []):
-                lv.append(ListItem(Label(f"[yellow]{col}[/]"), name=col))
+                badge = "  [dim green](✓ linked)[/dim green]" if (self._target_table, col) in existing_targets else ""
+                lv.append(ListItem(Label(f"[yellow]{col}[/]{badge}"), name=col))
 
         lv.focus()
 
@@ -524,14 +575,10 @@ class LinkBuilderScreen(ModalScreen[bool]):
     def item_selected(self, event: ListView.Selected) -> None:
         name = event.item.name
         if self._step == 1:
-            self._from_col = name
+            self._target_table = name
             self._step = 2
             self._render_step()
         elif self._step == 2:
-            self._target_table = name
-            self._step = 3
-            self._render_step()
-        elif self._step == 3:
             VirtualLinks.add(
                 self._db_path,
                 self._from_table, self._from_col,
@@ -559,7 +606,7 @@ class ExpandedTableScreen(ModalScreen):
         yield Header()
         yield Footer()
         yield Label(
-            f"[bold cyan]{self._title}[/]  [dim]{len(self._rows)} rows — Esc / F to close[/dim]",
+            f"[bold cyan]{self._title}[/]  [dim]{len(self._rows)} rows - Esc / F to close[/dim]",
             id="expanded-title",
         )
         dt = DataTable(
@@ -623,11 +670,14 @@ class ObservationScreen(Screen):
 
             # seed block
             bid = "seed"
+            _pk, _fk = _build_col_meta(self._conn, self._schema, obs.seed_table)
             blk = TableBlock(
                 table=obs.seed_table,
                 cols=obs.seed_cols,
                 rows=[obs.seed_row] if obs.seed_row else [],
                 is_seed=True,
+                pk_cols=_pk,
+                fk_cols=_fk,
                 id=f"block-{bid}",
                 classes="obs-block",
             )
@@ -639,11 +689,14 @@ class ObservationScreen(Screen):
             else:
                 for tbl_name, (cols, rows) in obs.related.items():
                     bid = tbl_name
+                    _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
                     blk = TableBlock(
                         table=tbl_name,
                         cols=cols,
                         rows=rows,
                         is_seed=False,
+                        pk_cols=_pk,
+                        fk_cols=_fk,
                         id=f"block-{bid}",
                         classes="obs-block",
                     )
@@ -659,42 +712,55 @@ class ObservationScreen(Screen):
         status: Label = self.query_one("#live-status")
         if value:
             status.update(
-                f"[bold green]● LIVE[/]  [dim]polling every {LIVE_INTERVAL}s — press L to stop[/dim]"
+                f"[bold green]● LIVE[/]  [dim]polling every {LIVE_INTERVAL}s - press L to stop[/dim]"
             )
             self._timer = self.set_interval(LIVE_INTERVAL, self._poll)
         else:
-            status.update("[dim]○ live off — press L to start[/dim]")
+            status.update("[dim]○ live off - press L to start[/dim]")
             if self._timer:
                 self._timer.stop()
                 self._timer = None
 
     def action_link(self) -> None:
-        """Open LinkBuilderScreen to define a virtual FK for the seed table."""
+        """Open LinkBuilderScreen using the currently focused cell as source."""
         db_path = self._schema.db_path
         if not db_path:
             return
 
+        # find focused DataTable and its parent TableBlock
+        focused = self.focused
+        if not isinstance(focused, DataTable):
+            self.notify("Focus a table cell first", severity="warning")
+            return
+        block = self._block_for_widget(focused)
+        if block is None:
+            return
+
+        # get the column name of the cursor cell (strip badge prefix)
+        col_index = focused.cursor_column
+        if col_index >= len(block.cols):
+            return
+        from_col = block.cols[col_index]
+
         def on_result(saved: bool) -> None:
             if saved:
                 VirtualLinks.inject(self._schema)
-                # rebuild observation so new linked rows appear immediately
                 self._obs = build_observation(
                     self._conn, self._schema,
                     self._table, self._pk_col, self._pk_val,
                 )
                 self.notify(
-                    f"Link saved — rebuilding observation",
+                    f"{block.tbl_name}.{from_col} linked",
                     title="Virtual link created",
                 )
-                # reload the observation blocks
                 self._rebuild_blocks()
 
         self.app.push_screen(
             LinkBuilderScreen(
                 db_path=db_path,
                 schema=self._schema,
-                from_table=self._table,
-                cols=self._obs.seed_cols,
+                from_table=block.tbl_name,
+                from_col=from_col,
             ),
             on_result,
         )
@@ -707,9 +773,11 @@ class ObservationScreen(Screen):
             if tbl_name in self._blocks:
                 continue   # already displayed
             bid = tbl_name
+            _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
             blk = TableBlock(
                 table=tbl_name, cols=cols, rows=rows,
-                is_seed=False, id=f"block-{bid}", classes="obs-block",
+                is_seed=False, pk_cols=_pk, fk_cols=_fk,
+                id=f"block-{bid}", classes="obs-block",
             )
             self._blocks[bid] = blk
             scroll.mount(blk)
@@ -734,18 +802,18 @@ class ObservationScreen(Screen):
 
     # ── drill-down on row select ──────────────
 
-    @on(DataTable.RowSelected)
-    def row_drilldown(self, event: DataTable.RowSelected) -> None:
-        """Open a new ObservationScreen for the selected row."""
+    @on(DataTable.CellSelected)
+    def row_drilldown(self, event: DataTable.CellSelected) -> None:
+        """Open a new ObservationScreen for the row of the selected cell."""
         block = self._block_for_widget(event.data_table)
         if block is None:
             return
 
-        # seed block uses cursor_type="row" but we don't drill into itself
+        # don't drill into the seed block
         if block.is_seed:
             return
 
-        row_index = event.cursor_row
+        row_index = event.coordinate.row
         if row_index >= len(block.all_rows):
             return
 
@@ -809,13 +877,16 @@ class ObservationScreen(Screen):
             if real_tbl in self._blocks:
                 self._blocks[real_tbl].add_new_rows(diff.new_rows)
             else:
-                # новая таблица появилась — создаём блок и монтируем
+                # новая таблица появилась - создаём блок и монтируем
                 bid = real_tbl
+                _pk, _fk = _build_col_meta(self._conn, self._schema, real_tbl)
                 blk = TableBlock(
                     table=real_tbl,
                     cols=diff.cols,
                     rows=diff.new_rows,
                     is_seed=False,
+                    pk_cols=_pk,
+                    fk_cols=_fk,
                     id=f"block-{bid}",
                     classes="obs-block",
                 )
@@ -837,7 +908,7 @@ class ObservationScreen(Screen):
             n_new = sum(len(d.new_rows) for d in diffs)
             new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
             status.update(
-                f"[bold green]● LIVE[/]  [dim]last poll {ts}{new_tag} — press L to stop[/dim]"
+                f"[bold green]● LIVE[/]  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
             )
 
 
@@ -859,20 +930,23 @@ class RowPickerScreen(Screen):
 
     def _reload(self) -> None:
         self.cols, self.rows = fetch_all_rows(self.conn, self.table)
+        pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
         dt = self.query_one("#row-table", DataTable)
         cur = dt.cursor_row
-        dt.clear()
+        dt.clear(columns=True)
+        headers = [_col_header(c, pk_cols, fk_cols) for c in self.cols]
+        dt.add_columns(*headers)
         for row in self.rows:
             dt.add_row(*[_fmt(v) for v in row], key=str(row))
         dt.move_cursor(row=min(cur, max(0, len(self.rows) - 1)))
-        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
+        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
 
     def action_refresh(self) -> None:
         self._reload()
         self.query_one("#row-table", DataTable).focus()
 
     def on_mount(self) -> None:
-        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) — Enter to observe"
+        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
         self.query_one("#row-table", DataTable).focus()
 
     def on_unmount(self) -> None:
@@ -881,8 +955,10 @@ class RowPickerScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
+        pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
         dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="row")
-        dt.add_columns(*self.cols)
+        headers = [_col_header(c, pk_cols, fk_cols) for c in self.cols]
+        dt.add_columns(*headers)
         for row in self.rows:
             dt.add_row(*[_fmt(v) for v in row], key=str(row))
         yield dt
@@ -917,7 +993,7 @@ class TablePickerScreen(Screen):
         yield Footer()
         with Vertical():
             yield Label(
-                f"[bold]Database:[/] [yellow]{self.db_path}[/]  —  pick a table",
+                f"[bold]Database:[/] [yellow]{self.db_path}[/]  -  pick a table",
                 classes="screen-title",
             )
             items = [ListItem(Label(t), name=t) for t in self.schema.tables]
