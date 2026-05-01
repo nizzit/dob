@@ -14,3 +14,10 @@ wheels/
 *.db-shm
 *.db-wal
 *.db-journal
+
+# RAG
+rag_storage/
+lightrag.*
+
+# Config
+*.dbobserver.json
