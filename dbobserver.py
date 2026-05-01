@@ -518,6 +518,10 @@ class TableBlock(Static):
         if not self.schema or event.data_table.id != f"dt-{self.id}":
             return
         col_name = self.cols[event.column_index]
+        self.toggle_sort(col_name)
+
+    def toggle_sort(self, col_name: str) -> None:
+        if not self.schema: return
         current_sort = self.schema.sort_prefs.get(self.tbl_name)
         if current_sort and current_sort[0] == col_name:
             new_sort = (col_name, not current_sort[1])
@@ -690,6 +694,7 @@ class ExpandedTableScreen(ModalScreen):
         Binding("escape,q,f", "dismiss",     "Close", show=True),
         Binding("l",          "toggle_live",  "Live", show=True),
         Binding("k",          "link",         "Link cols", show=True),
+        Binding("s",          "sort_column",  "Sort", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
@@ -746,7 +751,16 @@ class ExpandedTableScreen(ModalScreen):
     @on(DataTable.HeaderSelected, "#expanded-dt")
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
         if not self._schema or not self._tbl_name: return
-        col_name = self._cols[event.column_index]
+        self._toggle_sort(self._cols[event.column_index])
+
+    def action_sort_column(self) -> None:
+        if not self._schema or not self._tbl_name: return
+        dt = self.query_one("#expanded-dt", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self._cols): return
+        self._toggle_sort(self._cols[col_index])
+
+    def _toggle_sort(self, col_name: str) -> None:
         current_sort = self._schema.sort_prefs.get(self._tbl_name)
         if current_sort and current_sort[0] == col_name:
             new_sort = (col_name, not current_sort[1])
@@ -917,6 +931,7 @@ class ObservationScreen(Screen):
         Binding("l",        "toggle_live",    "Live",   show=True),
         Binding("f",        "expand_focused", "Expand", show=True),
         Binding("k",        "link",           "Link cols", show=True),
+        Binding("s",        "sort_column",    "Sort", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
@@ -1049,6 +1064,21 @@ class ObservationScreen(Screen):
             ),
             on_result,
         )
+
+    def action_sort_column(self) -> None:
+        focused = self.focused
+        if not isinstance(focused, DataTable):
+            self.notify("Focus a table cell first", severity="warning")
+            return
+        block = self._block_for_widget(focused)
+        if block is None:
+            return
+
+        col_index = focused.cursor_column
+        if col_index >= len(block.cols):
+            return
+        col_name = block.cols[col_index]
+        block.toggle_sort(col_name)
 
     def _rebuild_blocks(self) -> None:
         """Mount blocks for tables that appeared after a schema change."""
@@ -1216,6 +1246,7 @@ class RowPickerScreen(Screen):
         Binding("r",        "refresh",        "Refresh", show=True),
         Binding("l",        "toggle_live",    "Live", show=True),
         Binding("k",        "link",           "Link cols", show=True),
+        Binding("s",        "sort_column",    "Sort", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
@@ -1320,7 +1351,16 @@ class RowPickerScreen(Screen):
 
     @on(DataTable.HeaderSelected, "#row-table")
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
-        col_name = self.cols[event.column_index]
+        self._toggle_sort(self.cols[event.column_index])
+
+    def action_sort_column(self) -> None:
+        if not self.schema or not self.table: return
+        dt = self.query_one("#row-table", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self.cols): return
+        self._toggle_sort(self.cols[col_index])
+
+    def _toggle_sort(self, col_name: str) -> None:
         current_sort = self.schema.sort_prefs.get(self.table)
         if current_sort and current_sort[0] == col_name:
             new_sort = (col_name, not current_sort[1])
