@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -351,6 +352,50 @@ def _fmt(v: Any) -> str:
 def _row_strs(row: tuple) -> list[str]:
     return [_fmt(v) for v in row]
 
+def _mark_row(dt: DataTable, key: str, new: bool) -> None:
+    """Prefix first cell with ▶ marker for new rows."""
+    try:
+        cell = dt.get_cell(key, dt.ordered_columns[0].key)
+        val = str(cell).lstrip("▶ ")
+        if new:
+            val = f"▶ {val}"
+        dt.update_cell(key, dt.ordered_columns[0].key, val)
+    except Exception:
+        pass
+
+def update_live_label(lbl: Label | None, is_live: bool, extra: str = "") -> None:
+    if lbl is None:
+        return
+    if is_live:
+        lbl.update(
+            f"[bold green]● LIVE[/]  [dim]polling every {LIVE_INTERVAL}s - press L to stop[/dim]{extra}"
+        )
+    else:
+        lbl.update("[dim]○ live off - press L to start[/dim]")
+
+class RowFlasher:
+    def __init__(self) -> None:
+        self._flash: dict[str, int] = {}
+        
+    def add(self, key: str) -> None:
+        self._flash[key] = 3
+        
+    def tick(self, dt: DataTable) -> None:
+        if not self._flash:
+            return
+        expired = [k for k, v in self._flash.items() if v <= 1]
+        for key in expired:
+            _mark_row(dt, key, new=False)
+            del self._flash[key]
+        for key in self._flash:
+            self._flash[key] -= 1
+            
+    def count(self) -> int:
+        return len(self._flash)
+        
+    def clear(self) -> None:
+        self._flash.clear()
+
 
 def _build_col_meta(
     conn: sqlite3.Connection,
@@ -417,8 +462,7 @@ class TableBlock(Static):
         self.is_seed   = is_seed
         self._pk_cols: set[str]          = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
-        # row_key → flash countdown (ticks remaining)
-        self._flash: dict[str, int] = {}
+        self._flasher = RowFlasher()
 
     def compose(self) -> ComposeResult:
         color = SEED_STYLE if self.is_seed else REL_STYLE
@@ -448,44 +492,23 @@ class TableBlock(Static):
             self.all_rows.append(row)
             key = f"new-{id(row)}"
             dt.add_row(*_row_strs(row), key=key)
-            self._flash[key] = 3          # будет убран через 3 тика (~6 сек)
-            # подсветка через стиль строки не поддерживается в Textual напрямую -
-            # добавляем маркер в первую ячейку
-            self._mark_row(dt, key, new=True)
+            self._flasher.add(key)
+            _mark_row(dt, key, new=True)
 
         # обновляем счётчик в заголовке
         self._refresh_label()
 
     def tick_flash(self) -> None:
         """Called every poll tick. Removes highlight after countdown."""
-        if not self._flash:
-            return
-        dt = self._dt()
-        expired = [k for k, v in self._flash.items() if v <= 1]
-        for key in expired:
-            self._mark_row(dt, key, new=False)
-            del self._flash[key]
-        for key in self._flash:
-            self._flash[key] -= 1
-
-    def _mark_row(self, dt: DataTable, key: str, new: bool) -> None:
-        """Prefix first cell with ▶ marker for new rows."""
-        try:
-            cell = dt.get_cell(key, dt.ordered_columns[0].key)
-            val = str(cell)
-            # strip old marker
-            val = val.lstrip("▶ ")
-            if new:
-                val = f"▶ {val}"
-            dt.update_cell(key, dt.ordered_columns[0].key, val)
-        except Exception:
-            pass
+        if self._flasher.count() > 0:
+            self._flasher.tick(self._dt())
+            self._refresh_label()
 
     def _refresh_label(self) -> None:
         color  = SEED_STYLE if self.is_seed else REL_STYLE
         marker = "●" if self.is_seed else "◆"
         tag    = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
-        new_cnt = len(self._flash)
+        new_cnt = self._flasher.count()
         new_tag = f"  [bold green]+{new_cnt} new[/bold green]" if new_cnt else ""
         self._lbl().update(
             f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{new_tag}"
@@ -505,7 +528,7 @@ class LinkBuilderScreen(ModalScreen[bool]):
     Saves via VirtualLinks.add() and dismisses(True) on success.
     """
 
-    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel")]
+    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel", show=True)]
 
     def __init__(
         self,
@@ -592,35 +615,188 @@ class LinkBuilderScreen(ModalScreen[bool]):
 # ─────────────────────────────────────────────
 
 class ExpandedTableScreen(ModalScreen):
-    """Full-screen view of a single table. Esc to close."""
+    """Full-screen view of a single table. Esc to close. L to toggle live."""
 
-    BINDINGS = [Binding("escape,q,f", "dismiss", "Close")]
+    BINDINGS = [
+        Binding("escape,q,f", "dismiss",     "Close", show=True),
+        Binding("l",          "toggle_live",  "Live", show=True),
+        Binding("k",          "link",         "Link cols", show=True),
+    ]
 
-    def __init__(self, title: str, cols: list[str], rows: list[tuple]) -> None:
+    live: reactive[bool] = reactive(False)
+
+    def __init__(
+        self,
+        title:  str,
+        cols:   list[str],
+        rows:   list[tuple],
+        *,
+        conn:    sqlite3.Connection | None = None,
+        schema:  "Schema | None" = None,
+        tbl_name: str | None = None,
+        pk_cols:  set[str] | None = None,
+        fk_cols:  "dict[str, FKInfo] | None" = None,
+    ) -> None:
         super().__init__()
-        self._title = title
-        self._cols  = cols
-        self._rows  = rows
+        self._title    = title
+        self._cols     = cols
+        self._rows     = list(rows)
+        self._conn     = conn
+        self._schema   = schema
+        self._tbl_name = tbl_name
+        self._pk_cols: set[str]          = pk_cols or set()
+        self._fk_cols: dict[str, FKInfo] = fk_cols or {}
+        self._timer: Timer | None = None
+        # set of rows already shown (for diff highlighting)
+        self._known_rows: set[tuple] = set(rows)
+        self._flasher = RowFlasher()
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
+        yield Label("", id="live-status")
         yield Label(
             f"[bold cyan]{self._title}[/]  [dim]{len(self._rows)} rows - Esc / F to close[/dim]",
             id="expanded-title",
         )
+        headers = [_col_header(c, self._pk_cols, self._fk_cols) for c in self._cols]
         dt = DataTable(
             id="expanded-dt",
             zebra_stripes=True,
-            cursor_type="row",
+            cursor_type="cell",
         )
-        dt.add_columns(*self._cols)
+        dt.add_columns(*headers)
         for row in self._rows:
             dt.add_row(*_row_strs(row))
         yield dt
 
     def on_mount(self) -> None:
+        self._update_live_label()
         self.query_one("#expanded-dt", DataTable).focus()
+
+    # ── live toggle ──────────────────────────
+
+    def action_toggle_live(self) -> None:
+        if self._conn is None or self._tbl_name is None:
+            self.notify("Live mode unavailable (no DB context)", severity="warning")
+            return
+        self.live = not self.live
+
+    def watch_live(self, value: bool) -> None:
+        self._update_live_label()
+        if value:
+            self._timer = self.set_interval(LIVE_INTERVAL, self._poll)
+        else:
+            if self._timer:
+                self._timer.stop()
+                self._timer = None
+
+    def _update_live_label(self, extra: str = "") -> None:
+        try:
+            lbl = self.query_one("#live-status", Label)
+            update_live_label(lbl, self.live, extra)
+        except Exception:
+            pass
+
+    # ── poll ─────────────────────────────────
+
+    def _poll(self) -> None:
+        if self._conn is None or self._tbl_name is None:
+            return
+        try:
+            _, all_rows = fetch_all_rows(self._conn, self._tbl_name)
+        except Exception:
+            return
+
+        new_rows = [r for r in all_rows if r not in self._known_rows]
+        if new_rows:
+            dt = self.query_one("#expanded-dt", DataTable)
+            for row in new_rows:
+                self._rows.append(row)
+                self._known_rows.add(row)
+                key = f"new-{id(row)}"
+                dt.add_row(*_row_strs(row), key=key)
+                self._flasher.add(key)
+                _mark_row(dt, key, new=True)
+            self._refresh_title()
+
+        # tick flash
+        self._flasher.tick(self.query_one("#expanded-dt", DataTable))
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        n_new = len(new_rows)
+        new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
+        self._update_live_label(
+            f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
+            if self.live else ""
+        )
+
+    def _refresh_title(self) -> None:
+        try:
+            lbl: Label = self.query_one("#expanded-title", Label)
+            lbl.update(
+                f"[bold cyan]{self._title}[/]  "
+                f"[dim]{len(self._rows)} rows - Esc / F to close[/dim]"
+            )
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        if self._timer:
+            self._timer.stop()
+
+    # ── drill-down on row select ──────────────
+
+    @on(DataTable.CellSelected, "#expanded-dt")
+    def row_drilldown(self, event: DataTable.CellSelected) -> None:
+        if not self._conn or not self._schema or not self._tbl_name:
+            return
+
+        row_index = event.coordinate.row
+        if row_index >= len(self._rows):
+            return
+
+        raw_row  = self._rows[row_index]
+        row_dict = dict(zip(self._cols, raw_row))
+        pk_col   = get_pk_column(self._conn, self._tbl_name) or self._cols[0]
+        pk_val   = row_dict.get(pk_col, raw_row[0])
+
+        self.app.push_screen(
+            ObservationScreen(
+                self._conn, self._schema,
+                self._tbl_name, pk_col, pk_val,
+            )
+        )
+
+    # ── link builder ─────────────────────────
+
+    def action_link(self) -> None:
+        if not self._schema or not self._schema.db_path or not self._tbl_name:
+            return
+
+        dt = self.query_one("#expanded-dt", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self._cols):
+            return
+        from_col = self._cols[col_index]
+
+        def on_result(saved: bool) -> None:
+            if saved:
+                VirtualLinks.inject(self._schema)
+                self.notify(
+                    f"{self._tbl_name}.{from_col} linked",
+                    title="Virtual link created",
+                )
+
+        self.app.push_screen(
+            LinkBuilderScreen(
+                db_path=self._schema.db_path,
+                schema=self._schema,
+                from_table=self._tbl_name,
+                from_col=from_col,
+            ),
+            on_result,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -631,7 +807,7 @@ class ObservationScreen(Screen):
     """Shows the observation. Press L to toggle live polling."""
 
     BINDINGS = [
-        Binding("escape,q", "app.pop_screen", "Back"),
+        Binding("escape,q", "app.pop_screen", "Back", show=True),
         Binding("l",        "toggle_live",    "Live",   show=True),
         Binding("f",        "expand_focused", "Expand", show=True),
         Binding("k",        "link",           "Link cols", show=True),
@@ -709,14 +885,15 @@ class ObservationScreen(Screen):
         self.live = not self.live
 
     def watch_live(self, value: bool) -> None:
-        status: Label = self.query_one("#live-status")
+        try:
+            lbl = self.query_one("#live-status", Label)
+            update_live_label(lbl, value)
+        except Exception:
+            pass
+
         if value:
-            status.update(
-                f"[bold green]● LIVE[/]  [dim]polling every {LIVE_INTERVAL}s - press L to stop[/dim]"
-            )
             self._timer = self.set_interval(LIVE_INTERVAL, self._poll)
         else:
-            status.update("[dim]○ live off - press L to start[/dim]")
             if self._timer:
                 self._timer.stop()
                 self._timer = None
@@ -787,6 +964,10 @@ class ObservationScreen(Screen):
         # give keyboard focus to scroll container so arrow keys work
         self.query_one("#obs-scroll").focus()
 
+    def on_unmount(self) -> None:
+        if self._timer:
+            self._timer.stop()
+
     # ── expand ───────────────────────────────
 
     # ── helpers ──────────────────────────────
@@ -846,11 +1027,17 @@ class ObservationScreen(Screen):
         if target_block is None:
             return
 
+        _pk, _fk = _build_col_meta(self._conn, self._schema, target_block.tbl_name)
         self.app.push_screen(
             ExpandedTableScreen(
                 title=target_block.tbl_name,
                 cols=list(target_block.cols),
                 rows=list(target_block.all_rows),
+                conn=self._conn,
+                schema=self._schema,
+                tbl_name=target_block.tbl_name,
+                pk_cols=_pk,
+                fk_cols=_fk,
             )
         )
 
@@ -902,23 +1089,27 @@ class ObservationScreen(Screen):
 
         # refresh live-status with last-updated time
         if self.live:
-            from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
-            status: Label = self.query_one("#live-status")
             n_new = sum(len(d.new_rows) for d in diffs)
             new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
-            status.update(
-                f"[bold green]● LIVE[/]  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
-            )
+            try:
+                lbl = self.query_one("#live-status", Label)
+                update_live_label(lbl, self.live, f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]")
+            except Exception:
+                pass
 
 
 class RowPickerScreen(Screen):
-    """Pick a row from a table."""
+    """Pick a row from a table. L - live mode, R - manual refresh."""
 
     BINDINGS = [
-        Binding("escape,q", "app.pop_screen", "Back"),
-        Binding("r",        "refresh",        "Refresh"),
+        Binding("escape,q", "app.pop_screen", "Back", show=True),
+        Binding("r",        "refresh",        "Refresh", show=True),
+        Binding("l",        "toggle_live",    "Live", show=True),
+        Binding("k",        "link",           "Link cols", show=True),
     ]
+
+    live: reactive[bool] = reactive(False)
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, table: str) -> None:
         super().__init__()
@@ -927,9 +1118,60 @@ class RowPickerScreen(Screen):
         self.table  = table
         self.pk_col = get_pk_column(conn, table)
         self.cols, self.rows = fetch_all_rows(conn, table)
+        self._known_rows: set[tuple] = set(self.rows)
+        self._flasher = RowFlasher()
+        self._timer: Timer | None = None
+
+    # ── live ─────────────────────────────────
+
+    def action_toggle_live(self) -> None:
+        self.live = not self.live
+
+    def watch_live(self, value: bool) -> None:
+        self._update_live_label()
+        if value:
+            self._timer = self.set_interval(LIVE_INTERVAL, self._live_poll)
+        else:
+            if self._timer:
+                self._timer.stop()
+                self._timer = None
+
+    def _update_live_label(self, extra: str = "") -> None:
+        try:
+            lbl = self.query_one("#live-status", Label)
+            update_live_label(lbl, self.live, extra)
+        except Exception:
+            pass
+
+    def _live_poll(self) -> None:
+        _, all_rows = fetch_all_rows(self.conn, self.table)
+        new_rows = [r for r in all_rows if r not in self._known_rows]
+
+        if new_rows:
+            dt = self.query_one("#row-table", DataTable)
+            for row in new_rows:
+                self.rows.append(row)
+                self._known_rows.add(row)
+                key = f"live-{id(row)}"
+                dt.add_row(*[_fmt(v) for v in row], key=key)
+                self._flasher.add(key)
+                _mark_row(dt, key, new=True)
+            self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
+
+        # tick flash
+        self._flasher.tick(self.query_one("#row-table", DataTable))
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        n_new = len(new_rows)
+        new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
+        self._update_live_label(f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]")
+
+    # ── reload (manual refresh) ───────────────
 
     def _reload(self) -> None:
         self.cols, self.rows = fetch_all_rows(self.conn, self.table)
+        self._known_rows = set(self.rows)
+        self._flasher.clear()
         pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
         dt = self.query_one("#row-table", DataTable)
         cur = dt.cursor_row
@@ -947,25 +1189,29 @@ class RowPickerScreen(Screen):
 
     def on_mount(self) -> None:
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
+        self._update_live_label()
         self.query_one("#row-table", DataTable).focus()
 
     def on_unmount(self) -> None:
         self.app.sub_title = ""
+        if self._timer:
+            self._timer.stop()
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
+        yield Label("", id="live-status")
         pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
-        dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="row")
+        dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="cell")
         headers = [_col_header(c, pk_cols, fk_cols) for c in self.cols]
         dt.add_columns(*headers)
         for row in self.rows:
             dt.add_row(*[_fmt(v) for v in row], key=str(row))
         yield dt
 
-    @on(DataTable.RowSelected, "#row-table")
-    def row_selected(self, event: DataTable.RowSelected) -> None:
-        row_index = event.cursor_row
+    @on(DataTable.CellSelected, "#row-table")
+    def row_selected(self, event: DataTable.CellSelected) -> None:
+        row_index = event.coordinate.row
         if row_index >= len(self.rows):
             return
         raw_row  = self.rows[row_index]
@@ -976,11 +1222,42 @@ class RowPickerScreen(Screen):
         screen = ObservationScreen(self.conn, self.schema, self.table, pk_col, pk_val)
         self.app.push_screen(screen)
 
+    # ── link builder ─────────────────────────
+
+    def action_link(self) -> None:
+        if not self.schema or not self.schema.db_path or not self.table:
+            return
+
+        dt = self.query_one("#row-table", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self.cols):
+            return
+        from_col = self.cols[col_index]
+
+        def on_result(saved: bool) -> None:
+            if saved:
+                VirtualLinks.inject(self.schema)
+                self.notify(
+                    f"{self.table}.{from_col} linked",
+                    title="Virtual link created",
+                )
+                self._reload()
+
+        self.app.push_screen(
+            LinkBuilderScreen(
+                db_path=self.schema.db_path,
+                schema=self.schema,
+                from_table=self.table,
+                from_col=from_col,
+            ),
+            on_result,
+        )
+
 
 class TablePickerScreen(Screen):
     """Pick a table from the database."""
 
-    BINDINGS = [Binding("escape,q", "app.pop_screen", "Back")]
+    BINDINGS = [Binding("escape,q", "app.pop_screen", "Back", show=True)]
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, db_path: str) -> None:
         super().__init__()
@@ -1009,7 +1286,7 @@ class TablePickerScreen(Screen):
 class OpenDBScreen(Screen):
     """Entry screen."""
 
-    BINDINGS = [Binding("ctrl+q", "app.quit", "Quit")]
+    BINDINGS = [Binding("ctrl+q", "app.quit", "Quit", show=True)]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1151,7 +1428,7 @@ LinkBuilderScreen #link-hint {
 class DbObserverApp(App):
     TITLE = "DbObserver"
     CSS   = CSS
-    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
+    BINDINGS = [Binding("ctrl+q", "quit", "Quit", show=True)]
 
     def __init__(self, db_path: str | None = None) -> None:
         super().__init__()
