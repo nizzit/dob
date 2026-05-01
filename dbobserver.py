@@ -70,6 +70,8 @@ def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
     tables = [r[0] for r in cur.fetchall() if not r[0].startswith("sqlite_")]
 
     schema = Schema(tables=tables, db_path=db_path)
+    if db_path:
+        schema.sort_prefs = PersistedSort.load(db_path)
 
     # cache column names for each table
     for table in tables:
@@ -204,6 +206,38 @@ class VirtualLinks:
                 schema.fk_from[ft].append(fk)
                 schema.fk_to[tt].append(fk)
 
+
+class PersistedSort:
+    """Persists user-defined sort preferences in <db>.sort.json."""
+    
+    @staticmethod
+    def _path(db_path: str) -> Path:
+        return Path(db_path).with_suffix(".sort.json")
+
+    @classmethod
+    def load(cls, db_path: str) -> dict[str, tuple[str, bool]]:
+        p = cls._path(db_path)
+        if not p.exists():
+            return {}
+        try:
+            data = json.loads(p.read_text())
+            return {k: (v[0], bool(v[1])) for k, v in data.items()}
+        except Exception:
+            return {}
+
+    @classmethod
+    def save(cls, db_path: str, prefs: dict[str, tuple[str, bool]]) -> None:
+        if not db_path: return
+        cls._path(db_path).write_text(json.dumps(prefs, indent=2))
+
+def toggle_and_save_sort(schema: Schema, table: str, col_name: str) -> None:
+    current_sort = schema.sort_prefs.get(table)
+    if current_sort and current_sort[0] == col_name:
+        new_sort = (col_name, not current_sort[1])
+    else:
+        new_sort = (col_name, False)
+    schema.sort_prefs[table] = new_sort
+    PersistedSort.save(schema.db_path, schema.sort_prefs)
 
 # ─────────────────────────────────────────────
 # Graph traversal
@@ -522,12 +556,7 @@ class TableBlock(Static):
 
     def toggle_sort(self, col_name: str) -> None:
         if not self.schema: return
-        current_sort = self.schema.sort_prefs.get(self.tbl_name)
-        if current_sort and current_sort[0] == col_name:
-            new_sort = (col_name, not current_sort[1])
-        else:
-            new_sort = (col_name, False)
-        self.schema.sort_prefs[self.tbl_name] = new_sort
+        toggle_and_save_sort(self.schema, self.tbl_name, col_name)
         self._rebuild_dt()
 
     def _rebuild_dt(self) -> None:
@@ -752,22 +781,6 @@ class ExpandedTableScreen(ModalScreen):
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
         if not self._schema or not self._tbl_name: return
         self._toggle_sort(self._cols[event.column_index])
-
-    def action_sort_column(self) -> None:
-        if not self._schema or not self._tbl_name: return
-        dt = self.query_one("#expanded-dt", DataTable)
-        col_index = dt.cursor_column
-        if col_index >= len(self._cols): return
-        self._toggle_sort(self._cols[col_index])
-
-    def _toggle_sort(self, col_name: str) -> None:
-        current_sort = self._schema.sort_prefs.get(self._tbl_name)
-        if current_sort and current_sort[0] == col_name:
-            new_sort = (col_name, not current_sort[1])
-        else:
-            new_sort = (col_name, False)
-        self._schema.sort_prefs[self._tbl_name] = new_sort
-        self._rebuild_dt()
 
     def _rebuild_dt(self) -> None:
         if not self._schema or not self._tbl_name: return
@@ -1361,12 +1374,7 @@ class RowPickerScreen(Screen):
         self._toggle_sort(self.cols[col_index])
 
     def _toggle_sort(self, col_name: str) -> None:
-        current_sort = self.schema.sort_prefs.get(self.table)
-        if current_sort and current_sort[0] == col_name:
-            new_sort = (col_name, not current_sort[1])
-        else:
-            new_sort = (col_name, False)
-        self.schema.sort_prefs[self.table] = new_sort
+        toggle_and_save_sort(self.schema, self.table, col_name)
         self._rebuild_dt()
 
     def _rebuild_dt(self) -> None:
