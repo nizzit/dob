@@ -71,7 +71,8 @@ def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
 
     schema = Schema(tables=tables, db_path=db_path)
     if db_path:
-        schema.sort_prefs = PersistedSort.load(db_path)
+        data = ProjectSettings.load(db_path)
+        schema.sort_prefs = {k: (v[0], bool(v[1])) for k, v in data["sorts"].items()}
 
     # cache column names for each table
     for table in tables:
@@ -140,58 +141,73 @@ def fetch_related_rows(
 
 
 # ─────────────────────────────────────────────
-# Virtual links (user-defined pseudo-FK)
+# Project Settings (Links & Sorts)
 # ─────────────────────────────────────────────
 
-class VirtualLinks:
+class ProjectSettings:
     """
-    Persists user-defined column→column links in <db>.links.json.
-    Format: list of {from_table, from_col, to_table, to_col}
+    Persists user-defined settings in <db>.dbobserver.json.
+    Format: {
+        "links": [ {from_table, from_col, to_table, to_col}, ... ],
+        "sorts": { "table_name": ["col_name", reverse_bool], ... }
+    }
     """
 
     @staticmethod
     def _path(db_path: str) -> Path:
-        return Path(db_path).with_suffix(".links.json")
+        return Path(db_path).with_suffix(".dbobserver.json")
 
     @classmethod
-    def load(cls, db_path: str) -> list[dict]:
+    def load(cls, db_path: str) -> dict:
         p = cls._path(db_path)
         if not p.exists():
-            return []
+            return {"links": [], "sorts": {}}
         try:
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
+            return {
+                "links": data.get("links", []),
+                "sorts": data.get("sorts", {})
+            }
         except Exception:
-            return []
+            return {"links": [], "sorts": {}}
 
     @classmethod
-    def save(cls, db_path: str, links: list[dict]) -> None:
-        cls._path(db_path).write_text(json.dumps(links, indent=2))
+    def save(cls, db_path: str, data: dict) -> None:
+        if not db_path: return
+        cls._path(db_path).write_text(json.dumps(data, indent=2))
+
+class VirtualLinks:
+    """
+    Helper for user-defined column→column links.
+    """
 
     @classmethod
     def add(cls, db_path: str, from_table: str, from_col: str,
             to_table: str, to_col: str) -> None:
-        links = cls.load(db_path)
+        data = ProjectSettings.load(db_path)
         entry = dict(from_table=from_table, from_col=from_col,
                      to_table=to_table,   to_col=to_col)
-        if entry not in links:
-            links.append(entry)
-            cls.save(db_path, links)
+        if entry not in data["links"]:
+            data["links"].append(entry)
+            ProjectSettings.save(db_path, data)
 
     @classmethod
     def remove(cls, db_path: str, from_table: str, from_col: str,
                to_table: str, to_col: str) -> None:
-        links = cls.load(db_path)
+        data = ProjectSettings.load(db_path)
         entry = dict(from_table=from_table, from_col=from_col,
                      to_table=to_table,   to_col=to_col)
-        links = [ln for ln in links if ln != entry]
-        cls.save(db_path, links)
+        data["links"] = [ln for ln in data["links"] if ln != entry]
+        ProjectSettings.save(db_path, data)
 
     @classmethod
     def inject(cls, schema: Schema) -> None:
         """Add virtual FKInfo entries to an already-loaded Schema in-place."""
         if not schema.db_path:
             return
-        for entry in cls.load(schema.db_path):
+        
+        data = ProjectSettings.load(schema.db_path)
+        for entry in data["links"]:
             ft, fc = entry["from_table"], entry["from_col"]
             tt, tc = entry["to_table"],   entry["to_col"]
             if ft not in schema.fk_from:
@@ -207,29 +223,6 @@ class VirtualLinks:
                 schema.fk_to[tt].append(fk)
 
 
-class PersistedSort:
-    """Persists user-defined sort preferences in <db>.sort.json."""
-    
-    @staticmethod
-    def _path(db_path: str) -> Path:
-        return Path(db_path).with_suffix(".sort.json")
-
-    @classmethod
-    def load(cls, db_path: str) -> dict[str, tuple[str, bool]]:
-        p = cls._path(db_path)
-        if not p.exists():
-            return {}
-        try:
-            data = json.loads(p.read_text())
-            return {k: (v[0], bool(v[1])) for k, v in data.items()}
-        except Exception:
-            return {}
-
-    @classmethod
-    def save(cls, db_path: str, prefs: dict[str, tuple[str, bool]]) -> None:
-        if not db_path: return
-        cls._path(db_path).write_text(json.dumps(prefs, indent=2))
-
 def toggle_and_save_sort(schema: Schema, table: str, col_name: str) -> None:
     current_sort = schema.sort_prefs.get(table)
     if current_sort and current_sort[0] == col_name:
@@ -237,7 +230,10 @@ def toggle_and_save_sort(schema: Schema, table: str, col_name: str) -> None:
     else:
         new_sort = (col_name, False)
     schema.sort_prefs[table] = new_sort
-    PersistedSort.save(schema.db_path, schema.sort_prefs)
+    
+    data = ProjectSettings.load(schema.db_path)
+    data["sorts"] = schema.sort_prefs
+    ProjectSettings.save(schema.db_path, data)
 
 # ─────────────────────────────────────────────
 # Graph traversal
