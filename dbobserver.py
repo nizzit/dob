@@ -61,6 +61,7 @@ class Schema:
     fk_to:     dict[str, list[FKInfo]] = field(default_factory=dict)
     db_path:   str = ""                 # путь к .db для VirtualLinks
     col_cache: dict[str, list[str]] = field(default_factory=dict)  # table→cols
+    sort_prefs: dict[str, tuple[str, bool]] = field(default_factory=dict) # table→(col, reverse)
 
 
 def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
@@ -352,6 +353,22 @@ def _fmt(v: Any) -> str:
 def _row_strs(row: tuple) -> list[str]:
     return [_fmt(v) for v in row]
 
+def apply_sort(cols: list[str], rows: list[tuple], sort_info: tuple[str, bool] | None) -> None:
+    if not sort_info or sort_info[0] not in cols:
+        return
+    idx = cols.index(sort_info[0])
+    rev = sort_info[1]
+
+    def sort_key(row):
+        val = row[idx]
+        if val is None:
+            return (0, "")
+        if isinstance(val, (int, float, bool)):
+            return (1, float(val))
+        return (2, str(val))
+
+    rows.sort(key=sort_key, reverse=rev)
+
 def _mark_row(dt: DataTable, key: str, new: bool) -> None:
     """Prefix first cell with ▶ marker for new rows."""
     try:
@@ -417,12 +434,18 @@ def _build_col_meta(
     return pk_cols, fk_cols
 
 
-def _col_header(col: str, pk_cols: set[str], fk_cols: dict[str, FKInfo]) -> str:
+def _col_header(
+    col: str, 
+    pk_cols: set[str], 
+    fk_cols: dict[str, FKInfo], 
+    sort_info: tuple[str, bool] | None = None
+) -> str:
     """
     Return a column header string with relationship indicators:
       🔑 Primary key
       🔗 Real FK to another table
       ✨ Virtual (user-defined) link
+      ↑↓ Sort indicator
     Multiple indicators are stacked (e.g. 🔑🔗 for FK that is also PK).
     """
     if col in pk_cols:
@@ -439,9 +462,13 @@ def _col_header(col: str, pk_cols: set[str], fk_cols: dict[str, FKInfo]) -> str:
     else:
         fk_prefix = ""
 
+    suffix = ""
+    if sort_info and sort_info[0] == col:
+        suffix = " [bold]↓[/bold]" if sort_info[1] else " [bold]↑[/bold]"
+
     if pk_prefix or fk_prefix:
-        return f"{pk_prefix}{fk_prefix}{col}"
-    return col
+        return f"{pk_prefix}{fk_prefix}{col}{suffix}"
+    return f"{col}{suffix}"
 
 
 class TableBlock(Static):
@@ -454,12 +481,14 @@ class TableBlock(Static):
                  is_seed: bool = False,
                  pk_cols: set[str] | None = None,
                  fk_cols: dict[str, FKInfo] | None = None,
+                 schema: Schema | None = None,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.tbl_name  = table
         self.cols      = cols
         self.all_rows  = list(rows)
         self.is_seed   = is_seed
+        self.schema    = schema
         self._pk_cols: set[str]          = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         self._flasher = RowFlasher()
@@ -473,11 +502,48 @@ class TableBlock(Static):
             id=f"lbl-{self.id}",
         )
         dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="cell")
-        headers = [_col_header(c, self._pk_cols, self._fk_cols) for c in self.cols]
+        
+        sort_info = self.schema.sort_prefs.get(self.tbl_name) if self.schema else None
+        if self.schema:
+            apply_sort(self.cols, self.all_rows, sort_info)
+
+        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self.cols]
         dt.add_columns(*headers)
         for row in self.all_rows:
-            dt.add_row(*_row_strs(row))
+            dt.add_row(*_row_strs(row), key=f"r-{id(row)}")
         yield dt
+
+    @on(DataTable.HeaderSelected)
+    def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        if not self.schema or event.data_table.id != f"dt-{self.id}":
+            return
+        col_name = self.cols[event.column_index]
+        current_sort = self.schema.sort_prefs.get(self.tbl_name)
+        if current_sort and current_sort[0] == col_name:
+            new_sort = (col_name, not current_sort[1])
+        else:
+            new_sort = (col_name, False)
+        self.schema.sort_prefs[self.tbl_name] = new_sort
+        self._rebuild_dt()
+
+    def _rebuild_dt(self) -> None:
+        dt = self._dt()
+        cur_r, cur_c = dt.cursor_row, dt.cursor_column
+        
+        sort_info = self.schema.sort_prefs.get(self.tbl_name) if self.schema else None
+        if self.schema:
+            apply_sort(self.cols, self.all_rows, sort_info)
+
+        dt.clear(columns=True)
+        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self.cols]
+        dt.add_columns(*headers)
+        for row in self.all_rows:
+            key = f"r-{id(row)}"
+            dt.add_row(*_row_strs(row), key=key)
+            if key in self._flasher._flash:
+                _mark_row(dt, key, new=True)
+        dt.move_cursor(row=min(cur_r, max(0, len(self.all_rows) - 1)), column=cur_c)
+        self._refresh_label()
 
     def _dt(self) -> DataTable:
         return self.query_one(f"#dt-{self.id}", DataTable)
@@ -487,16 +553,19 @@ class TableBlock(Static):
 
     def add_new_rows(self, new_rows: list[tuple]) -> None:
         """Append rows and flash them green."""
-        dt = self._dt()
         for row in new_rows:
             self.all_rows.append(row)
-            key = f"new-{id(row)}"
-            dt.add_row(*_row_strs(row), key=key)
-            self._flasher.add(key)
-            _mark_row(dt, key, new=True)
+            self._flasher.add(f"r-{id(row)}")
 
-        # обновляем счётчик в заголовке
-        self._refresh_label()
+        if self.schema and self.schema.sort_prefs.get(self.tbl_name):
+            self._rebuild_dt()
+        else:
+            dt = self._dt()
+            for row in new_rows:
+                key = f"r-{id(row)}"
+                dt.add_row(*_row_strs(row), key=key)
+                _mark_row(dt, key, new=True)
+            self._refresh_label()
 
     def tick_flash(self) -> None:
         """Called every poll tick. Removes highlight after countdown."""
@@ -659,16 +728,48 @@ class ExpandedTableScreen(ModalScreen):
             f"[bold cyan]{self._title}[/]  [dim]{len(self._rows)} rows - Esc / F to close[/dim]",
             id="expanded-title",
         )
-        headers = [_col_header(c, self._pk_cols, self._fk_cols) for c in self._cols]
+        
+        apply_sort(self._cols, self._rows, self._schema.sort_prefs.get(self._tbl_name) if self._schema else None)
+        
         dt = DataTable(
             id="expanded-dt",
             zebra_stripes=True,
             cursor_type="cell",
         )
+        sort_info = self._schema.sort_prefs.get(self._tbl_name) if self._schema else None
+        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self._cols]
         dt.add_columns(*headers)
         for row in self._rows:
-            dt.add_row(*_row_strs(row))
+            dt.add_row(*_row_strs(row), key=f"r-{id(row)}")
         yield dt
+
+    @on(DataTable.HeaderSelected, "#expanded-dt")
+    def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        if not self._schema or not self._tbl_name: return
+        col_name = self._cols[event.column_index]
+        current_sort = self._schema.sort_prefs.get(self._tbl_name)
+        if current_sort and current_sort[0] == col_name:
+            new_sort = (col_name, not current_sort[1])
+        else:
+            new_sort = (col_name, False)
+        self._schema.sort_prefs[self._tbl_name] = new_sort
+        self._rebuild_dt()
+
+    def _rebuild_dt(self) -> None:
+        if not self._schema or not self._tbl_name: return
+        dt = self.query_one("#expanded-dt", DataTable)
+        cur_r, cur_c = dt.cursor_row, dt.cursor_column
+        apply_sort(self._cols, self._rows, self._schema.sort_prefs.get(self._tbl_name))
+        dt.clear(columns=True)
+        sort_info = self._schema.sort_prefs.get(self._tbl_name)
+        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self._cols]
+        dt.add_columns(*headers)
+        for row in self._rows:
+            key = f"r-{id(row)}"
+            dt.add_row(*_row_strs(row), key=key)
+            if key in self._flasher._flash:
+                _mark_row(dt, key, new=True)
+        dt.move_cursor(row=min(cur_r, max(0, len(self._rows) - 1)), column=cur_c)
 
     def on_mount(self) -> None:
         self._update_live_label()
@@ -710,14 +811,19 @@ class ExpandedTableScreen(ModalScreen):
 
         new_rows = [r for r in all_rows if r not in self._known_rows]
         if new_rows:
-            dt = self.query_one("#expanded-dt", DataTable)
             for row in new_rows:
                 self._rows.append(row)
                 self._known_rows.add(row)
-                key = f"new-{id(row)}"
-                dt.add_row(*_row_strs(row), key=key)
-                self._flasher.add(key)
-                _mark_row(dt, key, new=True)
+                self._flasher.add(f"r-{id(row)}")
+            
+            if self._schema and self._schema.sort_prefs.get(self._tbl_name):
+                self._rebuild_dt()
+            else:
+                dt = self.query_one("#expanded-dt", DataTable)
+                for row in new_rows:
+                    key = f"r-{id(row)}"
+                    dt.add_row(*_row_strs(row), key=key)
+                    _mark_row(dt, key, new=True)
             self._refresh_title()
 
         # tick flash
@@ -854,6 +960,7 @@ class ObservationScreen(Screen):
                 is_seed=True,
                 pk_cols=_pk,
                 fk_cols=_fk,
+                schema=self._schema,
                 id=f"block-{bid}",
                 classes="obs-block",
             )
@@ -873,6 +980,7 @@ class ObservationScreen(Screen):
                         is_seed=False,
                         pk_cols=_pk,
                         fk_cols=_fk,
+                        schema=self._schema,
                         id=f"block-{bid}",
                         classes="obs-block",
                     )
@@ -953,7 +1061,7 @@ class ObservationScreen(Screen):
             _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
             blk = TableBlock(
                 table=tbl_name, cols=cols, rows=rows,
-                is_seed=False, pk_cols=_pk, fk_cols=_fk,
+                is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
                 id=f"block-{bid}", classes="obs-block",
             )
             self._blocks[bid] = blk
@@ -1074,6 +1182,7 @@ class ObservationScreen(Screen):
                     is_seed=False,
                     pk_cols=_pk,
                     fk_cols=_fk,
+                    schema=self._schema,
                     id=f"block-{bid}",
                     classes="obs-block",
                 )
@@ -1148,14 +1257,19 @@ class RowPickerScreen(Screen):
         new_rows = [r for r in all_rows if r not in self._known_rows]
 
         if new_rows:
-            dt = self.query_one("#row-table", DataTable)
             for row in new_rows:
                 self.rows.append(row)
                 self._known_rows.add(row)
-                key = f"live-{id(row)}"
-                dt.add_row(*[_fmt(v) for v in row], key=key)
-                self._flasher.add(key)
-                _mark_row(dt, key, new=True)
+                self._flasher.add(f"r-{id(row)}")
+                
+            if self.schema.sort_prefs.get(self.table):
+                self._rebuild_dt()
+            else:
+                dt = self.query_one("#row-table", DataTable)
+                for row in new_rows:
+                    key = f"r-{id(row)}"
+                    dt.add_row(*[_fmt(v) for v in row], key=key)
+                    _mark_row(dt, key, new=True)
             self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
 
         # tick flash
@@ -1172,15 +1286,7 @@ class RowPickerScreen(Screen):
         self.cols, self.rows = fetch_all_rows(self.conn, self.table)
         self._known_rows = set(self.rows)
         self._flasher.clear()
-        pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
-        dt = self.query_one("#row-table", DataTable)
-        cur = dt.cursor_row
-        dt.clear(columns=True)
-        headers = [_col_header(c, pk_cols, fk_cols) for c in self.cols]
-        dt.add_columns(*headers)
-        for row in self.rows:
-            dt.add_row(*[_fmt(v) for v in row], key=str(row))
-        dt.move_cursor(row=min(cur, max(0, len(self.rows) - 1)))
+        self._rebuild_dt()
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
 
     def action_refresh(self) -> None:
@@ -1203,11 +1309,41 @@ class RowPickerScreen(Screen):
         yield Label("", id="live-status")
         pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
         dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="cell")
-        headers = [_col_header(c, pk_cols, fk_cols) for c in self.cols]
+        
+        apply_sort(self.cols, self.rows, self.schema.sort_prefs.get(self.table))
+        sort_info = self.schema.sort_prefs.get(self.table)
+        headers = [_col_header(c, pk_cols, fk_cols, sort_info) for c in self.cols]
         dt.add_columns(*headers)
         for row in self.rows:
-            dt.add_row(*[_fmt(v) for v in row], key=str(row))
+            dt.add_row(*_row_strs(row), key=f"r-{id(row)}")
         yield dt
+
+    @on(DataTable.HeaderSelected, "#row-table")
+    def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        col_name = self.cols[event.column_index]
+        current_sort = self.schema.sort_prefs.get(self.table)
+        if current_sort and current_sort[0] == col_name:
+            new_sort = (col_name, not current_sort[1])
+        else:
+            new_sort = (col_name, False)
+        self.schema.sort_prefs[self.table] = new_sort
+        self._rebuild_dt()
+
+    def _rebuild_dt(self) -> None:
+        dt = self.query_one("#row-table", DataTable)
+        cur_r, cur_c = dt.cursor_row, dt.cursor_column
+        apply_sort(self.cols, self.rows, self.schema.sort_prefs.get(self.table))
+        dt.clear(columns=True)
+        pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
+        sort_info = self.schema.sort_prefs.get(self.table)
+        headers = [_col_header(c, pk_cols, fk_cols, sort_info) for c in self.cols]
+        dt.add_columns(*headers)
+        for row in self.rows:
+            key = f"r-{id(row)}"
+            dt.add_row(*_row_strs(row), key=key)
+            if key in self._flasher._flash:
+                _mark_row(dt, key, new=True)
+        dt.move_cursor(row=min(cur_r, max(0, len(self.rows) - 1)), column=cur_c)
 
     @on(DataTable.CellSelected, "#row-table")
     def row_selected(self, event: DataTable.CellSelected) -> None:
