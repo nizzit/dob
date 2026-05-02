@@ -195,6 +195,39 @@ def fetch_related_rows(
     return cols, cur.fetchall()
 
 
+def fetch_related_rows_in(
+    conn: sqlite3.Connection,
+    table: str,
+    fk_col: str,
+    fk_vals: list[Any],
+    sort_info: tuple[str, bool] | None = None,
+) -> tuple[list[str], list[tuple]]:
+    """Batch variant of fetch_related_rows using WHERE fk_col IN (...)."""
+    vals = [v for v in fk_vals if v is not None]
+    if not vals:
+        return [], []
+
+    unique_vals = list(dict.fromkeys(vals))
+    cur = conn.cursor()
+    all_rows: list[tuple] = []
+    cols: list[str] = []
+
+    # Conservative chunk to stay below SQLite variable limits.
+    chunk_size = 900
+    for i in range(0, len(unique_vals), chunk_size):
+        chunk = unique_vals[i:i + chunk_size]
+        placeholders = ",".join("?" for _ in chunk)
+        cur.execute(
+            f'SELECT * FROM "{table}" WHERE "{fk_col}" IN ({placeholders}){_order_clause(sort_info)}',
+            chunk,
+        )
+        if not cols:
+            cols = [d[0] for d in cur.description]
+        all_rows.extend(cur.fetchall())
+
+    return cols, all_rows
+
+
 # ─────────────────────────────────────────────
 # Project Settings (Links & Sorts)
 # ─────────────────────────────────────────────
@@ -350,28 +383,28 @@ def build_observation(
     queue.append((table, seed_dict, cols, True))
 
     while queue:
-        cur_table, cur_dict, _cur_cols, allow_outgoing = queue.pop(0)
+        # Process one BFS wave in batches to avoid N+1 queries.
+        wave = queue
+        queue = []
 
-        # Recursive traversal: follow outgoing links (fk_from) only for
-        # rows that are allowed to expand outward.
-        if allow_outgoing:
+        by_table: dict[str, list[tuple[dict[str, Any], bool]]] = {}
+        for cur_table, cur_dict, _cur_cols, allow_outgoing in wave:
+            by_table.setdefault(cur_table, []).append((cur_dict, allow_outgoing))
+
+        for cur_table, items in by_table.items():
+            # Recursive traversal: follow outgoing links (fk_from) in batch.
             for fk in schema.fk_from.get(cur_table, []):
-                # Do not add simple lookup tables as separate blocks:
-                # their values are shown inline in referencing columns.
                 if is_lookup_table(conn, fk.to_table):
                     continue
-
-                # If this branch points back to seed table — stop immediately
-                # without reloading seed rows.
                 if fk.to_table == obs.seed_table:
                     continue
 
-                fk_val = cur_dict.get(fk.from_col)
-                if fk_val is None:
+                fk_vals = [d.get(fk.from_col) for d, allow in items if allow and d.get(fk.from_col) is not None]
+                if not fk_vals:
                     continue
 
                 sort_info = schema.sort_prefs.get(fk.to_table)
-                r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val, sort_info)
+                r_cols, r_rows = fetch_related_rows_in(conn, fk.to_table, fk.to_col, fk_vals, sort_info)
                 r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.to_table, r_cols, r_rows)
                 _merge(obs.related, fk.to_table, r_cols, r_rows)
                 if r_rows:
@@ -387,38 +420,33 @@ def build_observation(
                         visited.add(key)
                         queue.append((fk.to_table, r_dict, r_cols, True))
 
-        # Context expansion: for every visited row load tables that reference it.
-        # These rows are also expanded recursively via outgoing links.
-        for fk in schema.fk_to.get(cur_table, []):
-            # Do not add simple lookup tables as separate blocks:
-            # their values are shown inline in referencing columns.
-            if is_lookup_table(conn, fk.from_table):
-                continue
+            # Context expansion: load tables referencing current rows in batch.
+            for fk in schema.fk_to.get(cur_table, []):
+                if is_lookup_table(conn, fk.from_table):
+                    continue
+                if fk.from_table == obs.seed_table:
+                    continue
 
-            # Never reload seed table into related.
-            if fk.from_table == obs.seed_table:
-                continue
+                ref_vals = [d.get(fk.to_col) for d, _allow in items if d.get(fk.to_col) is not None]
+                if not ref_vals:
+                    continue
 
-            ref_val = cur_dict.get(fk.to_col)
-            if ref_val is None:
-                continue
+                sort_info = schema.sort_prefs.get(fk.from_table)
+                r_cols, r_rows = fetch_related_rows_in(conn, fk.from_table, fk.from_col, ref_vals, sort_info)
+                r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.from_table, r_cols, r_rows)
+                _merge(obs.related, fk.from_table, r_cols, r_rows)
+                if r_rows:
+                    _mark_related_kind(obs.related_kind, fk.from_table, "in")
+                    _mark_related_via(obs.related_via, fk.from_table, cur_table)
 
-            sort_info = schema.sort_prefs.get(fk.from_table)
-            r_cols, r_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, ref_val, sort_info)
-            r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.from_table, r_cols, r_rows)
-            _merge(obs.related, fk.from_table, r_cols, r_rows)
-            if r_rows:
-                _mark_related_kind(obs.related_kind, fk.from_table, "in")
-                _mark_related_via(obs.related_via, fk.from_table, cur_table)
-
-            for r_row in r_rows:
-                r_pk_col = get_pk_column(conn, fk.from_table) or r_cols[0]
-                r_dict = dict(zip(r_cols, r_row))
-                r_pk_val = r_dict.get(r_pk_col, r_row[0])
-                key = (fk.from_table, r_pk_col, r_pk_val)
-                if key not in visited:
-                    visited.add(key)
-                    queue.append((fk.from_table, r_dict, r_cols, True))
+                for r_row in r_rows:
+                    r_pk_col = get_pk_column(conn, fk.from_table) or r_cols[0]
+                    r_dict = dict(zip(r_cols, r_row))
+                    r_pk_val = r_dict.get(r_pk_col, r_row[0])
+                    key = (fk.from_table, r_pk_col, r_pk_val)
+                    if key not in visited:
+                        visited.add(key)
+                        queue.append((fk.from_table, r_dict, r_cols, True))
 
     # seed не должен дублироваться в related
     obs.related.pop(table, None)
