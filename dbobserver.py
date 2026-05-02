@@ -1903,7 +1903,8 @@ class RowPickerScreen(RuKeysMixin, Screen):
             pass
 
     def _live_poll(self) -> None:
-        _, all_rows = fetch_all_rows(self.conn, self.table)
+        sort_info = self.schema.sort_prefs.get(self.table)
+        _, all_rows = fetch_all_rows(self.conn, self.table, sort_info)
         new_rows = [r for r in all_rows if r not in self._known_rows]
 
         if new_rows:
