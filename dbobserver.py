@@ -131,6 +131,61 @@ def get_pk_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in cur.fetchall() if row[5] > 0}
 
 
+_LOOKUP_META_CACHE: dict[tuple[int, str], str | None] = {}
+_LOOKUP_VALUE_CACHE: dict[tuple[int, str, Any], Any] = {}
+
+
+def get_lookup_value_column(conn: sqlite3.Connection, table: str) -> str | None:
+    """Return dictionary value column for simple lookup table: id + one field."""
+    key = (id(conn), table)
+    if key in _LOOKUP_META_CACHE:
+        return _LOOKUP_META_CACHE[key]
+
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info('{table}')")
+    info = cur.fetchall()
+    if len(info) != 2:
+        _LOOKUP_META_CACHE[key] = None
+        return None
+
+    cols = [r[1] for r in info]
+    pk_cols = [r[1] for r in info if r[5] > 0]
+    if pk_cols != ["id"]:
+        _LOOKUP_META_CACHE[key] = None
+        return None
+
+    for c in cols:
+        if c != "id":
+            _LOOKUP_META_CACHE[key] = c
+            return c
+
+    _LOOKUP_META_CACHE[key] = None
+    return None
+
+
+def is_lookup_table(conn: sqlite3.Connection, table: str) -> bool:
+    return get_lookup_value_column(conn, table) is not None
+
+
+def fetch_lookup_value(conn: sqlite3.Connection, table: str, id_val: Any) -> Any:
+    """Return display value for lookup table row by id, or None when missing."""
+    key = (id(conn), table, id_val)
+    if key in _LOOKUP_VALUE_CACHE:
+        return _LOOKUP_VALUE_CACHE[key]
+
+    value_col = get_lookup_value_column(conn, table)
+    if not value_col:
+        _LOOKUP_VALUE_CACHE[key] = None
+        return None
+
+    cur = conn.cursor()
+    cur.execute(f'SELECT "{value_col}" FROM "{table}" WHERE "id" = ?', (id_val,))
+    row = cur.fetchone()
+    val = row[0] if row else None
+    _LOOKUP_VALUE_CACHE[key] = val
+    return val
+
+
 def fetch_related_rows(
     conn: sqlite3.Connection, table: str, fk_col: str, fk_val: Any, sort_info: tuple[str, bool] | None = None
 ) -> tuple[list[str], list[tuple]]:
@@ -301,6 +356,11 @@ def build_observation(
         # rows that are allowed to expand outward.
         if allow_outgoing:
             for fk in schema.fk_from.get(cur_table, []):
+                # Do not add simple lookup tables as separate blocks:
+                # their values are shown inline in referencing columns.
+                if is_lookup_table(conn, fk.to_table):
+                    continue
+
                 # If this branch points back to seed table — stop immediately
                 # without reloading seed rows.
                 if fk.to_table == obs.seed_table:
@@ -330,6 +390,11 @@ def build_observation(
         # Context expansion: for every visited row load tables that reference it.
         # These rows are also expanded recursively via outgoing links.
         for fk in schema.fk_to.get(cur_table, []):
+            # Do not add simple lookup tables as separate blocks:
+            # their values are shown inline in referencing columns.
+            if is_lookup_table(conn, fk.from_table):
+                continue
+
             # Never reload seed table into related.
             if fk.from_table == obs.seed_table:
                 continue
@@ -484,14 +549,14 @@ SEED_STYLE = "bold cyan"
 REL_STYLE  = "bold yellow"
 
 
-def _relation_visual(kind: str) -> tuple[str, str]:
+def _direction_tag(kind: str) -> str:
     if kind == "out":
-        return "▶", "bold yellow"
+        return " [dim]→[/dim]"
     if kind == "in":
-        return "◀", "bold magenta"
+        return " [dim]←[/dim]"
     if kind == "both":
-        return "◀▶", "bold green"
-    return "◆", REL_STYLE
+        return " [dim]↔[/dim]"
+    return ""
 
 
 def _via_text(via_tables: set[str] | None) -> str:
@@ -506,8 +571,18 @@ def _via_text(via_tables: set[str] | None) -> str:
 def _fmt(v: Any) -> str:
     return str(v) if v is not None else "NULL"
 
-def _row_strs(row: tuple) -> list[str]:
-    return [_fmt(v) for v in row]
+def _row_strs(row: tuple, inline_map: dict[int, tuple[str, Any]] | None = None) -> list[str]:
+    inline_map = inline_map or {}
+    out: list[str] = []
+    for i, v in enumerate(row):
+        base = _fmt(v)
+        if i in inline_map:
+            _, ref_value = inline_map[i]
+            rendered = _fmt(ref_value)
+            out.append(f"{base} [dim]≈ {rendered}[/dim]")
+        else:
+            out.append(base)
+    return out
 
 def _order_clause(sort_info: tuple[str, bool] | None) -> str:
     if not sort_info:
@@ -631,6 +706,37 @@ def _col_header(
     return f"{col}{suffix}"
 
 
+def _build_inline_lookup_map(
+    conn: sqlite3.Connection,
+    schema: Schema,
+    table: str,
+    cols: list[str],
+    row: tuple,
+) -> dict[int, tuple[str, Any]]:
+    """Map column index -> (lookup_table, lookup_value) for inline rendering."""
+    col_idx = {c: i for i, c in enumerate(cols)}
+    inline: dict[int, tuple[str, Any]] = {}
+
+    for fk in schema.fk_from.get(table, []):
+        if not is_lookup_table(conn, fk.to_table):
+            continue
+        if fk.from_col not in col_idx:
+            continue
+
+        idx = col_idx[fk.from_col]
+        fk_val = row[idx]
+        if fk_val is None:
+            continue
+
+        lookup_val = fetch_lookup_value(conn, fk.to_table, fk_val)
+        if lookup_val is None:
+            continue
+
+        inline[idx] = (fk.to_table, lookup_val)
+
+    return inline
+
+
 class TableBlock(Static):
     """
     One table section: header label + DataTable.
@@ -642,6 +748,7 @@ class TableBlock(Static):
                  pk_cols: set[str] | None = None,
                  fk_cols: dict[str, FKInfo] | None = None,
                  schema: Schema | None = None,
+                 conn: sqlite3.Connection | None = None,
                  relation_kind: str = "",
                  relation_via: set[str] | None = None,
                  **kwargs) -> None:
@@ -651,6 +758,7 @@ class TableBlock(Static):
         self.all_rows  = list(rows)
         self.is_seed   = is_seed
         self.schema    = schema
+        self._conn     = conn
         self.relation_kind = relation_kind
         self.relation_via = set(relation_via or set())
         self._pk_cols: set[str]          = pk_cols or set()
@@ -661,11 +769,12 @@ class TableBlock(Static):
         if self.is_seed:
             color, marker = SEED_STYLE, "●"
         else:
-            marker, color = _relation_visual(self.relation_kind)
+            color, marker = REL_STYLE, "◆"
         tag = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
+        dir_tag = "" if self.is_seed else _direction_tag(self.relation_kind)
         via_tag = "" if self.is_seed else _via_text(self.relation_via)
         yield Label(
-            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{via_tag}",
+            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{dir_tag}{via_tag}",
             id=f"lbl-{self.id}",
         )
         dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="cell")
@@ -674,7 +783,10 @@ class TableBlock(Static):
         headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self.cols]
         dt.add_columns(*headers)
         for row in self.all_rows:
-            dt.add_row(*_row_strs(row), key=str(row))
+            inline_map = {}
+            if self.schema and self._conn:
+                inline_map = _build_inline_lookup_map(self._conn, self.schema, self.tbl_name, self.cols, row)
+            dt.add_row(*_row_strs(row, inline_map), key=str(row))
         yield dt
 
     def refresh_col_meta(self, conn: sqlite3.Connection) -> None:
@@ -693,7 +805,10 @@ class TableBlock(Static):
         dt.add_columns(*headers)
         for row in self.all_rows:
             key = str(row)
-            dt.add_row(*_row_strs(row), key=key)
+            inline_map = {}
+            if self.schema and self._conn:
+                inline_map = _build_inline_lookup_map(self._conn, self.schema, self.tbl_name, self.cols, row)
+            dt.add_row(*_row_strs(row, inline_map), key=key)
             if key in self._flasher._flash:
                 _mark_row(dt, key, new=True)
         dt.move_cursor(row=min(cur_r, max(0, len(self.all_rows)-1)), column=cur_c)
@@ -723,13 +838,14 @@ class TableBlock(Static):
         if self.is_seed:
             color, marker = SEED_STYLE, "●"
         else:
-            marker, color = _relation_visual(self.relation_kind)
+            color, marker = REL_STYLE, "◆"
         tag    = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
+        dir_tag = "" if self.is_seed else _direction_tag(self.relation_kind)
         via_tag = "" if self.is_seed else _via_text(self.relation_via)
         new_cnt = self._flasher.count()
         new_tag = f"  [bold green]+{new_cnt} new[/bold green]" if new_cnt else ""
         self._lbl().update(
-            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{via_tag}{new_tag}"
+            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{dir_tag}{via_tag}{new_tag}"
         )
 
 
@@ -1379,6 +1495,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                 pk_cols=_pk,
                 fk_cols=_fk,
                 schema=self._schema,
+                conn=self._conn,
                 id=f"block-{bid}",
                 classes="obs-block",
             )
@@ -1399,6 +1516,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                         pk_cols=_pk,
                         fk_cols=_fk,
                         schema=self._schema,
+                        conn=self._conn,
                         relation_kind=obs.related_kind.get(tbl_name, ""),
                         relation_via=obs.related_via.get(tbl_name, set()),
                         id=f"block-{bid}",
@@ -1531,6 +1649,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                 blk = TableBlock(
                     table=tbl_name, cols=cols, rows=rows,
                     is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
+                    conn=self._conn,
                     relation_kind=obs.related_kind.get(tbl_name, ""),
                     relation_via=obs.related_via.get(tbl_name, set()),
                     id=f"block-{tbl_name}", classes="obs-block",
@@ -1689,6 +1808,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                     pk_cols=_pk,
                     fk_cols=_fk,
                     schema=self._schema,
+                    conn=self._conn,
                     relation_kind=new_obs.related_kind.get(real_tbl, ""),
                     relation_via=new_obs.related_via.get(real_tbl, set()),
                     id=f"block-{bid}",
