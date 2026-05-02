@@ -247,6 +247,11 @@ class Observation:
     seed_cols:  list[str]
     # table → (columns, rows)
     related: dict[str, tuple[list[str], list[tuple]]] = field(default_factory=dict)
+    # table → relation kind relative to traversal:
+    #   "out"  = table is a target of outgoing link (на что ссылаются)
+    #   "in"   = table is a source of incoming link (кто ссылается)
+    #   "both" = observed in both roles
+    related_kind: dict[str, str] = field(default_factory=dict)
 
 
 def build_observation(
@@ -262,96 +267,81 @@ def build_observation(
 
     obs = Observation(seed_table=table, seed_row=seed_row, seed_cols=cols)
 
-    # BFS strategy:
+    # Traversal strategy:
     #
-    # "Down" direction (parent → children, via fk_to):
-    #   Records that reference the current row are collected and enqueued
-    #   for further expansion — we want all descendants.
+    # 1) Recursive pass follows only outgoing links from the current row
+    #    (schema.fk_from: current_table.from_col -> to_table.to_col).
+    #    This includes real and virtual links in exactly the direction
+    #    they were declared.
     #
-    # "Up" direction (child → parent, via fk_from):
-    #   Direct parents of a row are collected for context, but they are
-    #   NOT enqueued for further expansion.  This prevents the BFS from
-    #   walking to sibling records (e.g. another customer reached via
-    #   address.billing_customer_id) and pulling in all their subtrees.
+    # 2) If recursive traversal reaches a link that points back to the
+    #    seed table, we stop that branch immediately (seed rows are not
+    #    loaded again).
     #
-    # visited: set of (table, pk_col, pk_val) — prevents duplicate processing.
-    # queue:   list of (tbl, row_dict, cols) — rows pending expansion.
-    # queue items: (tbl, row_dict, cols, is_seed)
-    # is_seed=True  — row may be expanded both UP and DOWN
-    # is_seed=False — row is expanded DOWN only; UP-parents are not collected
-    #                  (prevents dragging in sibling records from parent tables)
+    # 3) Incoming links to the seed table (schema.fk_to[seed]) are loaded
+    #    once for context, but are never traversed recursively.
     visited: set[tuple] = set()
-    queue: list[tuple[str, dict, list[str], bool]] = []
+    # queue item: (table, row_dict, row_cols, allow_outgoing)
+    # allow_outgoing=True  -> follow fk_from recursively
+    # allow_outgoing=False -> do not follow fk_from, only load incoming context (fk_to)
+    # NOTE: rows discovered via fk_to are now also enqueued with allow_outgoing=True
+    # so their outgoing links are expanded recursively as requested.
+    queue: list[tuple[str, dict[str, Any], list[str], bool]] = []
 
     seed_dict = dict(zip(cols, seed_row))
     visited.add((table, pk_col, pk_val))
     queue.append((table, seed_dict, cols, True))
 
     while queue:
-        cur_table, cur_dict, cur_cols, is_seed_row = queue.pop(0)
+        cur_table, cur_dict, _cur_cols, allow_outgoing = queue.pop(0)
 
-        cur_pk_cols = get_pk_columns(conn, cur_table)
+        # Recursive traversal: follow outgoing links (fk_from) only for
+        # rows that are allowed to expand outward.
+        if allow_outgoing:
+            for fk in schema.fk_from.get(cur_table, []):
+                # If this branch points back to seed table — stop immediately
+                # without reloading seed rows.
+                if fk.to_table == obs.seed_table:
+                    continue
 
-        # ── Classify fk_from entries for cur_table ───────────────────────
-        # fk_from contains two kinds of virtual links:
-        #
-        #  UP   — from_col is a regular (non-PK) column that holds a foreign
-        #          key value pointing to a parent table.  Example:
-        #          support_ticket.customer_id → customer.id
-        #          Only traversed for the seed row to avoid pulling in sibling
-        #          subtrees from unrelated parents.
-        #
-        #  DOWN — from_col is the PK of cur_table, meaning the linked table
-        #          contains child rows referencing this table.  Example:
-        #          support_ticket.id → ticket_message.ticket_id
-        #          Treated exactly like fk_to entries — traversed for every
-        #          row and enqueued for further expansion.
-        fk_up:   list[FKInfo] = []
-        fk_down: list[FKInfo] = []
-        for fk in schema.fk_from.get(cur_table, []):
-            if fk.from_col in cur_pk_cols:
-                fk_down.append(fk)
-            else:
-                fk_up.append(fk)
-
-        # ── UP: regular FK columns → parent tables ─────────────────────
-        # Only for seed row; parent rows are shown for context, not enqueued.
-        if is_seed_row:
-            for fk in fk_up:
                 fk_val = cur_dict.get(fk.from_col)
                 if fk_val is None:
                     continue
+
                 sort_info = schema.sort_prefs.get(fk.to_table)
                 r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val, sort_info)
+                r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.to_table, r_cols, r_rows)
                 _merge(obs.related, fk.to_table, r_cols, r_rows)
-                # NOT enqueued — prevents sibling subtree pollution.
+                if r_rows:
+                    _mark_related_kind(obs.related_kind, fk.to_table, "out")
 
-        # ── DOWN via fk_from (PK-based virtual links) → child tables ──
-        # Semantically identical to fk_to: cur_table is the parent.
-        for fk in fk_down:
-            ref_val = cur_dict.get(fk.from_col)  # value of PK column
-            if ref_val is None:
-                continue
-            sort_info = schema.sort_prefs.get(fk.to_table)
-            r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, ref_val, sort_info)
-            _merge(obs.related, fk.to_table, r_cols, r_rows)
-            for r_row in r_rows:
-                r_pk_col = get_pk_column(conn, fk.to_table) or r_cols[0]
-                r_dict = dict(zip(r_cols, r_row))
-                r_pk_val = r_dict.get(r_pk_col, r_row[0])
-                key = (fk.to_table, r_pk_col, r_pk_val)
-                if key not in visited:
-                    visited.add(key)
-                    queue.append((fk.to_table, r_dict, r_cols, False))
+                for r_row in r_rows:
+                    r_pk_col = get_pk_column(conn, fk.to_table) or r_cols[0]
+                    r_dict = dict(zip(r_cols, r_row))
+                    r_pk_val = r_dict.get(r_pk_col, r_row[0])
+                    key = (fk.to_table, r_pk_col, r_pk_val)
+                    if key not in visited:
+                        visited.add(key)
+                        queue.append((fk.to_table, r_dict, r_cols, True))
 
-        # ── DOWN via fk_to → child tables (enqueue) ──────────────────
+        # Context expansion: for every visited row load tables that reference it.
+        # These rows are also expanded recursively via outgoing links.
         for fk in schema.fk_to.get(cur_table, []):
+            # Never reload seed table into related.
+            if fk.from_table == obs.seed_table:
+                continue
+
             ref_val = cur_dict.get(fk.to_col)
             if ref_val is None:
                 continue
+
             sort_info = schema.sort_prefs.get(fk.from_table)
             r_cols, r_rows = fetch_related_rows(conn, fk.from_table, fk.from_col, ref_val, sort_info)
+            r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.from_table, r_cols, r_rows)
             _merge(obs.related, fk.from_table, r_cols, r_rows)
+            if r_rows:
+                _mark_related_kind(obs.related_kind, fk.from_table, "in")
+
             for r_row in r_rows:
                 r_pk_col = get_pk_column(conn, fk.from_table) or r_cols[0]
                 r_dict = dict(zip(r_cols, r_row))
@@ -359,10 +349,11 @@ def build_observation(
                 key = (fk.from_table, r_pk_col, r_pk_val)
                 if key not in visited:
                     visited.add(key)
-                    queue.append((fk.from_table, r_dict, r_cols, False))
+                    queue.append((fk.from_table, r_dict, r_cols, True))
 
     # seed не должен дублироваться в related
     obs.related.pop(table, None)
+    obs.related_kind.pop(table, None)
     
     # Final SQL sort for merged sets to guarantee correctness
     for tbl in list(obs.related.keys()):
@@ -372,6 +363,52 @@ def build_observation(
             obs.related[tbl] = (cols, sql_sort_rows(conn, tbl, cols, rows, sort_info))
 
     return obs
+
+
+def _mark_related_kind(kind_store: dict[str, str], table: str, kind: str) -> None:
+    prev = kind_store.get(table)
+    if prev is None:
+        kind_store[table] = kind
+    elif prev != kind:
+        kind_store[table] = "both"
+
+
+def _apply_seed_anchor(
+    schema: Schema,
+    seed_table: str,
+    seed_dict: dict[str, Any],
+    target_table: str,
+    cols: list[str],
+    rows: list[tuple],
+) -> list[tuple]:
+    """Keep only rows anchored to the seed row when target table points to seed.
+
+    If target_table has FK(s) to seed_table, at least one of those FK values must
+    match the corresponding value in the seed row.
+    """
+    if not rows:
+        return rows
+
+    anchor_fks = [
+        fk for fk in schema.fk_from.get(target_table, [])
+        if fk.to_table == seed_table
+    ]
+    if not anchor_fks:
+        return rows
+
+    col_idx = {c: i for i, c in enumerate(cols)}
+    checks: list[tuple[int, Any]] = []
+    for fk in anchor_fks:
+        if fk.from_col not in col_idx:
+            continue
+        if fk.to_col not in seed_dict:
+            continue
+        checks.append((col_idx[fk.from_col], seed_dict[fk.to_col]))
+
+    if not checks:
+        return rows
+
+    return [r for r in rows if any(r[idx] == seed_val for idx, seed_val in checks)]
 
 
 def _merge(
@@ -436,6 +473,16 @@ def diff_observations(old: Observation, new: Observation) -> list[TableDiff]:
 NEW_STYLE  = "bold green"
 SEED_STYLE = "bold cyan"
 REL_STYLE  = "bold yellow"
+
+
+def _relation_visual(kind: str) -> tuple[str, str, str]:
+    if kind == "out":
+        return "▶", "bold yellow", "(на что ссылается)"
+    if kind == "in":
+        return "◀", "bold magenta", "(кто ссылается)"
+    if kind == "both":
+        return "◀▶", "bold green", "(в обе стороны)"
+    return "◆", REL_STYLE, ""
 
 def _fmt(v: Any) -> str:
     return str(v) if v is not None else "NULL"
@@ -576,6 +623,7 @@ class TableBlock(Static):
                  pk_cols: set[str] | None = None,
                  fk_cols: dict[str, FKInfo] | None = None,
                  schema: Schema | None = None,
+                 relation_kind: str = "",
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.tbl_name  = table
@@ -583,16 +631,20 @@ class TableBlock(Static):
         self.all_rows  = list(rows)
         self.is_seed   = is_seed
         self.schema    = schema
+        self.relation_kind = relation_kind
         self._pk_cols: set[str]          = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         self._flasher = RowFlasher()
 
     def compose(self) -> ComposeResult:
-        color = SEED_STYLE if self.is_seed else REL_STYLE
-        marker = "●" if self.is_seed else "◆"
+        if self.is_seed:
+            color, marker, role = SEED_STYLE, "●", "(seed)"
+        else:
+            marker, color, role = _relation_visual(self.relation_kind)
         tag = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
+        role_tag = "" if self.is_seed or not role else f" [dim]{role}[/dim]"
         yield Label(
-            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]",
+            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{role_tag}",
             id=f"lbl-{self.id}",
         )
         dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="cell")
@@ -638,14 +690,21 @@ class TableBlock(Static):
             self._flasher.tick(self._dt())
             self._refresh_label()
 
+    def set_relation_kind(self, relation_kind: str) -> None:
+        self.relation_kind = relation_kind
+        self._refresh_label()
+
     def _refresh_label(self) -> None:
-        color  = SEED_STYLE if self.is_seed else REL_STYLE
-        marker = "●" if self.is_seed else "◆"
+        if self.is_seed:
+            color, marker, role = SEED_STYLE, "●", "(seed)"
+        else:
+            marker, color, role = _relation_visual(self.relation_kind)
         tag    = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
+        role_tag = "" if self.is_seed or not role else f" [dim]{role}[/dim]"
         new_cnt = self._flasher.count()
         new_tag = f"  [bold green]+{new_cnt} new[/bold green]" if new_cnt else ""
         self._lbl().update(
-            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{new_tag}"
+            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{role_tag}{new_tag}"
         )
 
 
@@ -888,8 +947,15 @@ class LinkBuilderScreen(ModalScreen[bool]):
                 lv.append(ListItem(Label(f"[cyan]{tbl}[/]"), name=tbl))
 
         elif self._step == 2:
-            # mark columns that are already a target of a link from this source
-            existing_targets = {
+            # Existing targets for this source column.
+            # - real_targets are hidden (already guaranteed by schema FK)
+            # - virtual_targets are shown but marked as already linked
+            real_targets = {
+                (fk.to_table, fk.to_col)
+                for fk in self._schema.fk_from.get(self._from_table, [])
+                if (not fk.virtual) and fk.from_col == self._from_col
+            }
+            virtual_targets = {
                 (fk.to_table, fk.to_col)
                 for fk in self._schema.fk_from.get(self._from_table, [])
                 if fk.virtual and fk.from_col == self._from_col
@@ -900,9 +966,16 @@ class LinkBuilderScreen(ModalScreen[bool]):
                 f"[bold cyan]{self._target_table}[/].[?] "
                 f"[dim]Step 2 of 2: pick target column[/dim]"
             )
+            shown = 0
             for col in self._schema.col_cache.get(self._target_table, []):
-                badge = "  [dim green](✓ linked)[/dim green]" if (self._target_table, col) in existing_targets else ""
+                if (self._target_table, col) in real_targets:
+                    continue
+                badge = "  [dim green](✓ linked)[/dim green]" if (self._target_table, col) in virtual_targets else ""
                 lv.append(ListItem(Label(f"[yellow]{col}[/]{badge}"), name=col))
+                shown += 1
+
+            if shown == 0:
+                lv.append(ListItem(Label("[dim]No available columns (real FK already exists).[/dim]"), name="_none"))
 
         lv.focus()
 
@@ -916,6 +989,23 @@ class LinkBuilderScreen(ModalScreen[bool]):
             self._step = 2
             self._render_step()
         elif self._step == 2:
+            if name == "_none":
+                return
+            # Avoid saving duplicates (especially when a real FK already exists).
+            dup = any(
+                fk.from_col == self._from_col
+                and fk.to_table == self._target_table
+                and fk.to_col == name
+                for fk in self._schema.fk_from.get(self._from_table, [])
+            )
+            if dup:
+                self.notify(
+                    f"Link already exists: {self._from_table}.{self._from_col} → {self._target_table}.{name}",
+                    title="Duplicate link",
+                    severity="warning",
+                )
+                return
+
             VirtualLinks.add(
                 self._db_path,
                 self._from_table, self._from_col,
@@ -1284,6 +1374,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                         pk_cols=_pk,
                         fk_cols=_fk,
                         schema=self._schema,
+                        relation_kind=obs.related_kind.get(tbl_name, ""),
                         id=f"block-{bid}",
                         classes="obs-block",
                     )
@@ -1406,12 +1497,14 @@ class ObservationScreen(RuKeysMixin, Screen):
         for tbl_name, (cols, rows) in obs.related.items():
             if tbl_name in self._blocks:
                 self._blocks[tbl_name].refresh_col_meta(self._conn)
+                self._blocks[tbl_name].set_relation_kind(obs.related_kind.get(tbl_name, ""))
                 self._blocks[tbl_name].update_rows(rows)
             else:
                 _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
                 blk = TableBlock(
                     table=tbl_name, cols=cols, rows=rows,
                     is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
+                    relation_kind=obs.related_kind.get(tbl_name, ""),
                     id=f"block-{tbl_name}", classes="obs-block",
                 )
                 self._blocks[tbl_name] = blk
@@ -1551,6 +1644,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                 if real_tbl == new_obs.seed_table:
                     blk.update_rows([new_obs.seed_row] if new_obs.seed_row else [])
                 else:
+                    blk.set_relation_kind(new_obs.related_kind.get(real_tbl, ""))
                     blk.update_rows(new_obs.related[real_tbl][1])
             else:
                 # новая таблица появилась - создаём блок и монтируем
@@ -1564,6 +1658,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                     pk_cols=_pk,
                     fk_cols=_fk,
                     schema=self._schema,
+                    relation_kind=new_obs.related_kind.get(real_tbl, ""),
                     id=f"block-{bid}",
                     classes="obs-block",
                 )
