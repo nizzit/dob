@@ -625,6 +625,24 @@ def update_live_label(lbl: Label | None, is_live: bool, extra: str = "") -> None
     else:
         lbl.update("[dim]○ live off - press L to start[/dim]")
 
+
+def _app_live_get(app: App, table: str | None) -> bool:
+    if not table:
+        return False
+    getter = getattr(app, "is_table_live", None)
+    if callable(getter):
+        return bool(getter(table))
+    return False
+
+
+def _app_live_set(app: App, table: str | None, value: bool) -> None:
+    if not table:
+        return
+    setter = getattr(app, "set_table_live", None)
+    if callable(setter):
+        setter(table, value)
+
+
 class RowFlasher:
     def __init__(self) -> None:
         self._flash: dict[str, int] = {}
@@ -1280,7 +1298,7 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
         dt.move_cursor(row=min(cur_r, max(0, len(self._rows) - 1)), column=cur_c)
 
     def on_mount(self) -> None:
-        self._update_live_label()
+        self.live = _app_live_get(self.app, self._tbl_name)
         self.query_one("#expanded-dt", DataTable).focus()
 
     # ── live toggle ──────────────────────────
@@ -1290,6 +1308,7 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
             self.notify("Live mode unavailable (no DB context)", severity="warning")
             return
         self.live = not self.live
+        _app_live_set(self.app, self._tbl_name, self.live)
 
     def watch_live(self, value: bool) -> None:
         self._update_live_label()
@@ -1529,6 +1548,7 @@ class ObservationScreen(RuKeysMixin, Screen):
 
     def action_toggle_live(self) -> None:
         self.live = not self.live
+        _app_live_set(self.app, self._table, self.live)
 
     def watch_live(self, value: bool) -> None:
         try:
@@ -1658,7 +1678,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                 scroll.mount(blk)
 
     def on_mount(self) -> None:
-        self.watch_live(False)   # set initial status label
+        self.live = _app_live_get(self.app, self._table)
         # give keyboard focus to scroll container so arrow keys work
         self.query_one("#obs-scroll").focus()
 
@@ -1864,6 +1884,7 @@ class RowPickerScreen(RuKeysMixin, Screen):
 
     def action_toggle_live(self) -> None:
         self.live = not self.live
+        _app_live_set(self.app, self.table, self.live)
 
     def watch_live(self, value: bool) -> None:
         self._update_live_label()
@@ -1917,7 +1938,7 @@ class RowPickerScreen(RuKeysMixin, Screen):
 
     def on_mount(self) -> None:
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
-        self._update_live_label()
+        self.live = _app_live_get(self.app, self.table)
         self.query_one("#row-table", DataTable).focus()
 
     def on_unmount(self) -> None:
@@ -2232,6 +2253,13 @@ class DbObserverApp(App):
     def __init__(self, db_path: str | None = None) -> None:
         super().__init__()
         self.initial_db_path = db_path
+        self._table_live_state: dict[str, bool] = {}
+
+    def is_table_live(self, table: str) -> bool:
+        return self._table_live_state.get(table, False)
+
+    def set_table_live(self, table: str, value: bool) -> None:
+        self._table_live_state[table] = bool(value)
 
     def on_mount(self) -> None:
         screen = OpenDBScreen()
