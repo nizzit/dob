@@ -23,6 +23,7 @@ from typing import Any
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual import events
 from textual.containers import Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
@@ -688,10 +689,40 @@ class LinkBuilderScreen(ModalScreen[bool]):
 
 
 # ─────────────────────────────────────────────
+# Russian keyboard layout support
+# ─────────────────────────────────────────────
+
+# Maps Russian ЙЦУКЕН keys to their English QWERTY equivalents
+_RU_TO_EN: dict[str, str] = {
+    "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t",
+    "н": "y", "г": "u", "ш": "i", "щ": "o", "з": "p",
+    "ф": "a", "ы": "s", "в": "d", "а": "f", "п": "g",
+    "р": "h", "о": "j", "л": "k", "д": "l",
+    "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b",
+    "т": "n", "ь": "m",
+}
+
+
+class RuKeysMixin:
+    """Mixin that re-fires key events translated from Russian layout to English."""
+
+    async def on_key(self, event: events.Key) -> None:
+        en = _RU_TO_EN.get(event.character or "")
+        if not en:
+            return
+        for binding in self.BINDINGS:  # type: ignore[attr-defined]
+            keys = [k.strip() for k in binding.key.split(",")]
+            if en in keys:
+                await self.run_action(binding.action)  # type: ignore[attr-defined]
+                event.stop()
+                break
+
+
+# ─────────────────────────────────────────────
 # Expanded (fullscreen) table modal
 # ─────────────────────────────────────────────
 
-class ExpandedTableScreen(ModalScreen):
+class ExpandedTableScreen(RuKeysMixin, ModalScreen):
     """Full-screen view of a single table. Esc to close. L to toggle live."""
 
     BINDINGS = [
@@ -904,7 +935,7 @@ class ExpandedTableScreen(ModalScreen):
 # Screens
 # ─────────────────────────────────────────────
 
-class ObservationScreen(Screen):
+class ObservationScreen(RuKeysMixin, Screen):
     """Shows the observation. Press L to toggle live polling."""
 
     BINDINGS = [
@@ -1247,7 +1278,7 @@ class ObservationScreen(Screen):
                 pass
 
 
-class RowPickerScreen(Screen):
+class RowPickerScreen(RuKeysMixin, Screen):
     """Pick a row from a table. L - live mode, R - manual refresh."""
 
     BINDINGS = [
@@ -1426,7 +1457,7 @@ class RowPickerScreen(Screen):
         )
 
 
-class TablePickerScreen(Screen):
+class TablePickerScreen(RuKeysMixin, Screen):
     """Pick a table from the database."""
 
     BINDINGS = [Binding("escape,q", "app.pop_screen", "Back", show=True)]
