@@ -1203,11 +1203,94 @@ class RuKeysMixin:
                 break
 
 
+class SortableSingleTableMixin:
+    """Reusable sort actions for screens that display one DataTable of one DB table."""
+
+    def _sort_schema(self) -> "Schema | None":
+        raise NotImplementedError
+
+    def _sort_table_name(self) -> str | None:
+        raise NotImplementedError
+
+    def _sort_columns(self) -> list[str]:
+        raise NotImplementedError
+
+    def _sort_datatable_id(self) -> str:
+        raise NotImplementedError
+
+    def _after_sort_toggle(self) -> None:
+        raise NotImplementedError
+
+    def _toggle_sort(self, col_name: str) -> None:
+        schema = self._sort_schema()
+        table = self._sort_table_name()
+        if not schema or not table:
+            return
+        toggle_and_save_sort(schema, table, col_name)
+        self._after_sort_toggle()
+
+    def action_sort_column(self) -> None:
+        schema = self._sort_schema()
+        table = self._sort_table_name()
+        if not schema or not table:
+            return
+        dt = self.query_one(self._sort_datatable_id(), DataTable)  # type: ignore[attr-defined]
+        col_index = dt.cursor_column
+        cols = self._sort_columns()
+        if col_index >= len(cols):
+            return
+        self._toggle_sort(cols[col_index])
+
+
+class SortableFocusedTableMixin:
+    """Reusable sorting for screens where active table depends on focused DataTable."""
+
+    def _focused_sort_schema(self) -> "Schema | None":
+        raise NotImplementedError
+
+    def _focused_sort_block_for_widget(self, widget) -> "TableBlock | None":
+        raise NotImplementedError
+
+    def _after_focused_sort_toggle(self) -> None:
+        raise NotImplementedError
+
+    def _focused_sort_missing_focus_message(self) -> str:
+        return "Focus a table cell first"
+
+    def _toggle_focused_sort(self, table: str, col_name: str) -> None:
+        schema = self._focused_sort_schema()
+        if not schema:
+            return
+        toggle_and_save_sort(schema, table, col_name)
+        self._after_focused_sort_toggle()
+
+    def action_sort_column(self) -> None:
+        focused = getattr(self, "focused", None)
+        if not isinstance(focused, DataTable):
+            self.notify(self._focused_sort_missing_focus_message(), severity="warning")  # type: ignore[attr-defined]
+            return
+        block = self._focused_sort_block_for_widget(focused)
+        if block is None:
+            return
+        col_index = focused.cursor_column
+        if col_index >= len(block.cols):
+            return
+        self._toggle_focused_sort(block.tbl_name, block.cols[col_index])
+
+    def _sort_from_header_event(self, event: DataTable.HeaderSelected) -> None:
+        block = self._focused_sort_block_for_widget(event.data_table)
+        if block is None:
+            return
+        if event.column_index >= len(block.cols):
+            return
+        self._toggle_focused_sort(block.tbl_name, block.cols[event.column_index])
+
+
 # ─────────────────────────────────────────────
 # Expanded (fullscreen) table modal
 # ─────────────────────────────────────────────
 
-class ExpandedTableScreen(RuKeysMixin, ModalScreen):
+class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
     """Full-screen view of a single table. Esc to close. L to toggle live."""
 
     BINDINGS = [
@@ -1278,8 +1361,24 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
 
     @on(DataTable.HeaderSelected, "#expanded-dt")
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
-        if not self._schema or not self._tbl_name: return
+        if event.column_index >= len(self._cols):
+            return
         self._toggle_sort(self._cols[event.column_index])
+
+    def _sort_schema(self) -> "Schema | None":
+        return self._schema
+
+    def _sort_table_name(self) -> str | None:
+        return self._tbl_name
+
+    def _sort_columns(self) -> list[str]:
+        return self._cols
+
+    def _sort_datatable_id(self) -> str:
+        return "#expanded-dt"
+
+    def _after_sort_toggle(self) -> None:
+        self._redraw_dt()
 
     def _redraw_dt(self) -> None:
         if not self._schema or not self._tbl_name: return
@@ -1461,7 +1560,7 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
 # Screens
 # ─────────────────────────────────────────────
 
-class ObservationScreen(RuKeysMixin, Screen):
+class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
     """Shows the observation. Press L to toggle live polling."""
 
     BINDINGS = [
@@ -1624,20 +1723,13 @@ class ObservationScreen(RuKeysMixin, Screen):
                 on_builder_result,
             )
 
-    def action_sort_column(self) -> None:
-        focused = self.focused
-        if not isinstance(focused, DataTable):
-            self.notify("Focus a table cell first", severity="warning")
-            return
-        block = self._block_for_widget(focused)
-        if block is None:
-            return
+    def _focused_sort_schema(self) -> "Schema | None":
+        return self._schema
 
-        col_index = focused.cursor_column
-        if col_index >= len(block.cols):
-            return
-        col_name = block.cols[col_index]
-        toggle_and_save_sort(self._schema, block.tbl_name, col_name)
+    def _focused_sort_block_for_widget(self, widget) -> "TableBlock | None":
+        return self._block_for_widget(widget)
+
+    def _after_focused_sort_toggle(self) -> None:
         self._reload()
 
     def _rebuild_blocks(self) -> None:
@@ -1709,11 +1801,7 @@ class ObservationScreen(RuKeysMixin, Screen):
 
     @on(DataTable.HeaderSelected)
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
-        block = self._block_for_widget(event.data_table)
-        if not block: return
-        col_name = block.cols[event.column_index]
-        toggle_and_save_sort(self._schema, block.tbl_name, col_name)
-        self._reload()
+        self._sort_from_header_event(event)
 
     def _reload(self) -> None:
         """Fetch fresh observation after sort changes, completely redraw all blocks."""
@@ -1862,7 +1950,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                 pass
 
 
-class RowPickerScreen(RuKeysMixin, Screen):
+class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
     """Pick a row from a table. L - live mode, R - manual refresh."""
 
     BINDINGS = [
@@ -1978,15 +2066,19 @@ class RowPickerScreen(RuKeysMixin, Screen):
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
         self._toggle_sort(self.cols[event.column_index])
 
-    def action_sort_column(self) -> None:
-        if not self.schema or not self.table: return
-        dt = self.query_one("#row-table", DataTable)
-        col_index = dt.cursor_column
-        if col_index >= len(self.cols): return
-        self._toggle_sort(self.cols[col_index])
+    def _sort_schema(self) -> "Schema | None":
+        return self.schema
 
-    def _toggle_sort(self, col_name: str) -> None:
-        toggle_and_save_sort(self.schema, self.table, col_name)
+    def _sort_table_name(self) -> str | None:
+        return self.table
+
+    def _sort_columns(self) -> list[str]:
+        return self.cols
+
+    def _sort_datatable_id(self) -> str:
+        return "#row-table"
+
+    def _after_sort_toggle(self) -> None:
         self._reload()
 
     def _redraw_dt(self) -> None:
