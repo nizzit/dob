@@ -604,6 +604,11 @@ class TableBlock(Static):
             dt.add_row(*_row_strs(row), key=str(row))
         yield dt
 
+    def refresh_col_meta(self, conn: sqlite3.Connection) -> None:
+        """Re-read FK/PK metadata from schema (call after schema changes)."""
+        if self.schema:
+            self._pk_cols, self._fk_cols = _build_col_meta(conn, self.schema, self.tbl_name)
+
     def update_rows(self, rows: list[tuple]) -> None:
         """Replace all rows and completely redraw the data table."""
         self.all_rows = list(rows)
@@ -1388,6 +1393,7 @@ class ObservationScreen(RuKeysMixin, Screen):
         # update seed block
         seed_blk = self._blocks.get("seed")
         if seed_blk:
+            seed_blk.refresh_col_meta(self._conn)
             seed_blk.update_rows([obs.seed_row] if obs.seed_row else [])
 
         # remove blocks for tables no longer in observation
@@ -1399,6 +1405,7 @@ class ObservationScreen(RuKeysMixin, Screen):
         # update existing blocks / add new ones
         for tbl_name, (cols, rows) in obs.related.items():
             if tbl_name in self._blocks:
+                self._blocks[tbl_name].refresh_col_meta(self._conn)
                 self._blocks[tbl_name].update_rows(rows)
             else:
                 _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
