@@ -290,20 +290,61 @@ def build_observation(
     while queue:
         cur_table, cur_dict, cur_cols, is_seed_row = queue.pop(0)
 
-        # ── UP: FK from cur_table → parent tables ──────────────────────
-        # Only done for the seed row. For descendant rows we skip UP-traversal
-        # entirely so that we never pull in unrelated sibling subtrees.
+        cur_pk_cols = get_pk_columns(conn, cur_table)
+
+        # ── Classify fk_from entries for cur_table ───────────────────────
+        # fk_from contains two kinds of virtual links:
+        #
+        #  UP   — from_col is a regular (non-PK) column that holds a foreign
+        #          key value pointing to a parent table.  Example:
+        #          support_ticket.customer_id → customer.id
+        #          Only traversed for the seed row to avoid pulling in sibling
+        #          subtrees from unrelated parents.
+        #
+        #  DOWN — from_col is the PK of cur_table, meaning the linked table
+        #          contains child rows referencing this table.  Example:
+        #          support_ticket.id → ticket_message.ticket_id
+        #          Treated exactly like fk_to entries — traversed for every
+        #          row and enqueued for further expansion.
+        fk_up:   list[FKInfo] = []
+        fk_down: list[FKInfo] = []
+        for fk in schema.fk_from.get(cur_table, []):
+            if fk.from_col in cur_pk_cols:
+                fk_down.append(fk)
+            else:
+                fk_up.append(fk)
+
+        # ── UP: regular FK columns → parent tables ─────────────────────
+        # Only for seed row; parent rows are shown for context, not enqueued.
         if is_seed_row:
-            for fk in schema.fk_from.get(cur_table, []):
+            for fk in fk_up:
                 fk_val = cur_dict.get(fk.from_col)
                 if fk_val is None:
                     continue
                 sort_info = schema.sort_prefs.get(fk.to_table)
                 r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val, sort_info)
                 _merge(obs.related, fk.to_table, r_cols, r_rows)
-                # Parent rows shown for context only — NOT enqueued.
+                # NOT enqueued — prevents sibling subtree pollution.
 
-        # ── DOWN: FK pointing to cur_table → child tables (enqueue) ───
+        # ── DOWN via fk_from (PK-based virtual links) → child tables ──
+        # Semantically identical to fk_to: cur_table is the parent.
+        for fk in fk_down:
+            ref_val = cur_dict.get(fk.from_col)  # value of PK column
+            if ref_val is None:
+                continue
+            sort_info = schema.sort_prefs.get(fk.to_table)
+            r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, ref_val, sort_info)
+            _merge(obs.related, fk.to_table, r_cols, r_rows)
+            for r_row in r_rows:
+                r_pk_col = get_pk_column(conn, fk.to_table) or r_cols[0]
+                r_dict = dict(zip(r_cols, r_row))
+                r_pk_val = r_dict.get(r_pk_col, r_row[0])
+                key = (fk.to_table, r_pk_col, r_pk_val)
+                if key not in visited:
+                    visited.add(key)
+                    queue.append((fk.to_table, r_dict, r_cols, False))
+
+        # ── DOWN via fk_to → child tables (enqueue) ──────────────────
         for fk in schema.fk_to.get(cur_table, []):
             ref_val = cur_dict.get(fk.to_col)
             if ref_val is None:
