@@ -227,7 +227,7 @@ def toggle_and_save_sort(schema: Schema, table: str, col_name: str) -> None:
     if current_sort and current_sort[0] == col_name:
         new_sort = (col_name, not current_sort[1])
     else:
-        new_sort = (col_name, False)
+        new_sort = (col_name, True)  # первое нажатие → по убыванию
     schema.sort_prefs[table] = new_sort
     
     data = ProjectSettings.load(schema.db_path)
