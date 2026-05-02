@@ -645,6 +645,186 @@ class TableBlock(Static):
 
 
 # ─────────────────────────────────────────────
+# Virtual-link manager modal
+# ─────────────────────────────────────────────
+
+class LinkManagerScreen(ModalScreen[bool]):
+    """
+    Menu for managing existing virtual links on a column.
+    Shows all current links and lets the user:
+      • Create a new link  (opens LinkBuilderScreen)
+      • Edit an existing link  (delete old + create new)
+      • Delete an existing link
+    Dismisses(True) if any change was made.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=True)]
+
+    def __init__(
+        self,
+        db_path:    str,
+        schema:     Schema,
+        from_table: str,
+        from_col:   str,
+    ) -> None:
+        super().__init__()
+        self._db_path    = db_path
+        self._schema     = schema
+        self._from_table = from_table
+        self._from_col   = from_col
+        self._changed    = False
+        # all virtual links from this column
+        self._links: list[FKInfo] = [
+            fk for fk in schema.fk_from.get(from_table, [])
+            if fk.virtual and fk.from_col == from_col
+        ]
+        # action items: (kind, label, fk|None)
+        #   kind = "new" | "edit" | "delete"
+        self._items: list[tuple[str, str, FKInfo | None]] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield Label("", id="mgr-heading")
+        yield ListView(id="mgr-list")
+        yield Label("[dim]Enter - select │ Esc - cancel[/dim]", id="mgr-hint")
+
+    def on_mount(self) -> None:
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        # refresh links from schema
+        self._links = [
+            fk for fk in self._schema.fk_from.get(self._from_table, [])
+            if fk.virtual and fk.from_col == self._from_col
+        ]
+
+        heading: Label = self.query_one("#mgr-heading", Label)
+        heading.update(
+            f"[bold cyan]Virtual links[/]  "
+            f"[bold]{self._from_table}[/].[bold yellow]{self._from_col}[/]  "
+            f"[dim]({len(self._links)} link{'s' if len(self._links) != 1 else ''})[/dim]"
+        )
+
+        lv: ListView = self.query_one("#mgr-list", ListView)
+        lv.clear()
+        self._items = []
+
+        # ── «create new» item ───────────────────────────
+        self._items.append(("new", "", None))
+        lv.append(ListItem(
+            Label("[bold green]＋  Create new link[/bold green]"),
+            name="new",
+        ))
+
+        if self._links:
+            # separator label (not selectable, but visually distinct)
+            lv.append(ListItem(Label("[dim]─── existing links ─────────────────────[/dim]"), name="_sep"))
+            self._items.append(("_sep", "", None))
+
+            for fk in self._links:
+                label_text = (
+                    f"[cyan]{fk.to_table}[/].[yellow]{fk.to_col}[/]"
+                )
+                # edit action
+                edit_label = f"[bold]✎[/bold]  {label_text}  [dim]edit[/dim]"
+                self._items.append(("edit", "", fk))
+                lv.append(ListItem(Label(edit_label), name=f"edit:{fk.to_table}:{fk.to_col}"))
+
+                # delete action
+                del_label = f"[bold red]✕[/bold red]  {label_text}  [dim]delete[/dim]"
+                self._items.append(("delete", "", fk))
+                lv.append(ListItem(Label(del_label), name=f"del:{fk.to_table}:{fk.to_col}"))
+
+        lv.focus()
+        lv.index = 0
+
+    @on(ListView.Selected, "#mgr-list")
+    def item_selected(self, event: ListView.Selected) -> None:
+        name = event.item.name or ""
+
+        if name == "_sep":
+            return   # separator – ignore
+
+        if name == "new":
+            self._open_builder(edit_fk=None)
+            return
+
+        if name.startswith("edit:"):
+            _, to_table, to_col = name.split(":", 2)
+            fk = self._find_link(to_table, to_col)
+            if fk:
+                self._open_builder(edit_fk=fk)
+            return
+
+        if name.startswith("del:"):
+            _, to_table, to_col = name.split(":", 2)
+            fk = self._find_link(to_table, to_col)
+            if fk:
+                self._delete_link(fk)
+            return
+
+    def _find_link(self, to_table: str, to_col: str) -> FKInfo | None:
+        for fk in self._links:
+            if fk.to_table == to_table and fk.to_col == to_col:
+                return fk
+        return None
+
+    def _delete_link(self, fk: FKInfo) -> None:
+        VirtualLinks.remove(
+            self._db_path,
+            fk.from_table, fk.from_col,
+            fk.to_table, fk.to_col,
+        )
+        # remove from schema in-place
+        self._schema.fk_from.get(fk.from_table, []).remove(fk)
+        self._schema.fk_to.get(fk.to_table, []).remove(fk)
+        self._changed = True
+        self._rebuild()
+        self.notify(
+            f"{fk.from_table}.{fk.from_col} → {fk.to_table}.{fk.to_col} removed",
+            title="Link deleted",
+        )
+
+    def _open_builder(self, edit_fk: FKInfo | None) -> None:
+        """Open LinkBuilderScreen. If edit_fk given, delete old link first on success."""
+
+        def on_result(saved: bool) -> None:
+            if saved:
+                if edit_fk is not None:
+                    # delete the old link that was replaced
+                    VirtualLinks.remove(
+                        self._db_path,
+                        edit_fk.from_table, edit_fk.from_col,
+                        edit_fk.to_table, edit_fk.to_col,
+                    )
+                    try:
+                        self._schema.fk_from.get(edit_fk.from_table, []).remove(edit_fk)
+                        self._schema.fk_to.get(edit_fk.to_table, []).remove(edit_fk)
+                    except ValueError:
+                        pass
+                VirtualLinks.inject(self._schema)
+                self._changed = True
+                self._rebuild()
+
+        self.app.push_screen(
+            LinkBuilderScreen(
+                db_path=self._db_path,
+                schema=self._schema,
+                from_table=self._from_table,
+                from_col=self._from_col,
+            ),
+            on_result,
+        )
+
+    def on_unmount(self) -> None:
+        pass
+
+    def action_cancel(self) -> None:
+        self.dismiss(self._changed)
+
+
+# ─────────────────────────────────────────────
 # Link builder modal
 # ─────────────────────────────────────────────
 
@@ -975,7 +1155,7 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
             )
         )
 
-    # ── link builder ─────────────────────────
+    # ── link builder / manager ───────────────
 
     def action_link(self) -> None:
         if not self._schema or not self._schema.db_path or not self._tbl_name:
@@ -987,23 +1167,39 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
             return
         from_col = self._cols[col_index]
 
-        def on_result(saved: bool) -> None:
-            if saved:
-                VirtualLinks.inject(self._schema)
-                self.notify(
-                    f"{self._tbl_name}.{from_col} linked",
-                    title="Virtual link created",
-                )
+        existing = [
+            fk for fk in self._schema.fk_from.get(self._tbl_name, [])
+            if fk.virtual and fk.from_col == from_col
+        ]
 
-        self.app.push_screen(
-            LinkBuilderScreen(
-                db_path=self._schema.db_path,
-                schema=self._schema,
-                from_table=self._tbl_name,
-                from_col=from_col,
-            ),
-            on_result,
-        )
+        def on_change(changed: bool) -> None:
+            if changed:
+                VirtualLinks.inject(self._schema)
+
+        if existing:
+            self.app.push_screen(
+                LinkManagerScreen(
+                    db_path=self._schema.db_path,
+                    schema=self._schema,
+                    from_table=self._tbl_name,
+                    from_col=from_col,
+                ),
+                on_change,
+            )
+        else:
+            def on_builder_result(saved: bool) -> None:
+                if saved:
+                    VirtualLinks.inject(self._schema)
+                    self.notify(f"{self._tbl_name}.{from_col} linked", title="Virtual link created")
+            self.app.push_screen(
+                LinkBuilderScreen(
+                    db_path=self._schema.db_path,
+                    schema=self._schema,
+                    from_table=self._tbl_name,
+                    from_col=from_col,
+                ),
+                on_builder_result,
+            )
 
 
 # ─────────────────────────────────────────────
@@ -1109,7 +1305,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                 self._timer = None
 
     def action_link(self) -> None:
-        """Open LinkBuilderScreen using the currently focused cell as source."""
+        """Open link manager (or builder if no links yet) for the focused column."""
         db_path = self._schema.db_path
         if not db_path:
             return
@@ -1123,34 +1319,50 @@ class ObservationScreen(RuKeysMixin, Screen):
         if block is None:
             return
 
-        # get the column name of the cursor cell (strip badge prefix)
+        # get the column name of the cursor cell
         col_index = focused.cursor_column
         if col_index >= len(block.cols):
             return
         from_col = block.cols[col_index]
 
-        def on_result(saved: bool) -> None:
-            if saved:
+        existing = [
+            fk for fk in self._schema.fk_from.get(block.tbl_name, [])
+            if fk.virtual and fk.from_col == from_col
+        ]
+
+        def on_result(changed: bool) -> None:
+            if changed:
                 VirtualLinks.inject(self._schema)
                 self._obs = build_observation(
                     self._conn, self._schema,
                     self._table, self._pk_col, self._pk_val,
                 )
-                self.notify(
-                    f"{block.tbl_name}.{from_col} linked",
-                    title="Virtual link created",
-                )
                 self._rebuild_blocks()
 
-        self.app.push_screen(
-            LinkBuilderScreen(
-                db_path=db_path,
-                schema=self._schema,
-                from_table=block.tbl_name,
-                from_col=from_col,
-            ),
-            on_result,
-        )
+        if existing:
+            self.app.push_screen(
+                LinkManagerScreen(
+                    db_path=db_path,
+                    schema=self._schema,
+                    from_table=block.tbl_name,
+                    from_col=from_col,
+                ),
+                on_result,
+            )
+        else:
+            def on_builder_result(saved: bool) -> None:
+                if saved:
+                    on_result(True)
+                    self.notify(f"{block.tbl_name}.{from_col} linked", title="Virtual link created")
+            self.app.push_screen(
+                LinkBuilderScreen(
+                    db_path=db_path,
+                    schema=self._schema,
+                    from_table=block.tbl_name,
+                    from_col=from_col,
+                ),
+                on_builder_result,
+            )
 
     def action_sort_column(self) -> None:
         focused = self.focused
@@ -1169,21 +1381,34 @@ class ObservationScreen(RuKeysMixin, Screen):
         self._reload()
 
     def _rebuild_blocks(self) -> None:
-        """Mount blocks for tables that appeared after a schema change."""
+        """Sync displayed blocks to current observation (add, update, remove)."""
         scroll: VerticalScroll = self.query_one("#obs-scroll")
         obs = self._obs
+
+        # update seed block
+        seed_blk = self._blocks.get("seed")
+        if seed_blk:
+            seed_blk.update_rows([obs.seed_row] if obs.seed_row else [])
+
+        # remove blocks for tables no longer in observation
+        gone = [tbl for tbl in list(self._blocks) if tbl != "seed" and tbl not in obs.related]
+        for tbl in gone:
+            blk = self._blocks.pop(tbl)
+            blk.remove()
+
+        # update existing blocks / add new ones
         for tbl_name, (cols, rows) in obs.related.items():
             if tbl_name in self._blocks:
-                continue   # already displayed
-            bid = tbl_name
-            _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
-            blk = TableBlock(
-                table=tbl_name, cols=cols, rows=rows,
-                is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
-                id=f"block-{bid}", classes="obs-block",
-            )
-            self._blocks[bid] = blk
-            scroll.mount(blk)
+                self._blocks[tbl_name].update_rows(rows)
+            else:
+                _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
+                blk = TableBlock(
+                    table=tbl_name, cols=cols, rows=rows,
+                    is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
+                    id=f"block-{tbl_name}", classes="obs-block",
+                )
+                self._blocks[tbl_name] = blk
+                scroll.mount(blk)
 
     def on_mount(self) -> None:
         self.watch_live(False)   # set initial status label
@@ -1504,7 +1729,7 @@ class RowPickerScreen(RuKeysMixin, Screen):
         screen = ObservationScreen(self.conn, self.schema, self.table, pk_col, pk_val)
         self.app.push_screen(screen)
 
-    # ── link builder ─────────────────────────
+    # ── link builder / manager ───────────────
 
     def action_link(self) -> None:
         if not self.schema or not self.schema.db_path or not self.table:
@@ -1516,24 +1741,41 @@ class RowPickerScreen(RuKeysMixin, Screen):
             return
         from_col = self.cols[col_index]
 
-        def on_result(saved: bool) -> None:
-            if saved:
+        existing = [
+            fk for fk in self.schema.fk_from.get(self.table, [])
+            if fk.virtual and fk.from_col == from_col
+        ]
+
+        def on_change(changed: bool) -> None:
+            if changed:
                 VirtualLinks.inject(self.schema)
-                self.notify(
-                    f"{self.table}.{from_col} linked",
-                    title="Virtual link created",
-                )
                 self._reload()
 
-        self.app.push_screen(
-            LinkBuilderScreen(
-                db_path=self.schema.db_path,
-                schema=self.schema,
-                from_table=self.table,
-                from_col=from_col,
-            ),
-            on_result,
-        )
+        if existing:
+            self.app.push_screen(
+                LinkManagerScreen(
+                    db_path=self.schema.db_path,
+                    schema=self.schema,
+                    from_table=self.table,
+                    from_col=from_col,
+                ),
+                on_change,
+            )
+        else:
+            def on_builder_result(saved: bool) -> None:
+                if saved:
+                    VirtualLinks.inject(self.schema)
+                    self.notify(f"{self.table}.{from_col} linked", title="Virtual link created")
+                    self._reload()
+            self.app.push_screen(
+                LinkBuilderScreen(
+                    db_path=self.schema.db_path,
+                    schema=self.schema,
+                    from_table=self.table,
+                    from_col=from_col,
+                ),
+                on_builder_result,
+            )
 
 
 class TablePickerScreen(RuKeysMixin, Screen):
@@ -1701,6 +1943,27 @@ LinkBuilderScreen ListView {
 }
 
 LinkBuilderScreen #link-hint {
+    margin: 1 2 0 2;
+    height: 1;
+}
+
+LinkManagerScreen {
+    align: center middle;
+}
+
+LinkManagerScreen #mgr-heading {
+    margin: 0 2 1 2;
+    height: 1;
+}
+
+LinkManagerScreen ListView {
+    width: 80;
+    height: 1fr;
+    max-height: 30;
+    border: solid $accent;
+}
+
+LinkManagerScreen #mgr-hint {
     margin: 1 2 0 2;
     height: 1;
 }
