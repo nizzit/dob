@@ -248,10 +248,12 @@ class Observation:
     # table → (columns, rows)
     related: dict[str, tuple[list[str], list[tuple]]] = field(default_factory=dict)
     # table → relation kind relative to traversal:
-    #   "out"  = table is a target of outgoing link (на что ссылаются)
-    #   "in"   = table is a source of incoming link (кто ссылается)
+    #   "out"  = table is a target of outgoing link
+    #   "in"   = table is a source of incoming link
     #   "both" = observed in both roles
     related_kind: dict[str, str] = field(default_factory=dict)
+    # table → set of table names through which this table was reached
+    related_via: dict[str, set[str]] = field(default_factory=dict)
 
 
 def build_observation(
@@ -314,6 +316,7 @@ def build_observation(
                 _merge(obs.related, fk.to_table, r_cols, r_rows)
                 if r_rows:
                     _mark_related_kind(obs.related_kind, fk.to_table, "out")
+                    _mark_related_via(obs.related_via, fk.to_table, cur_table)
 
                 for r_row in r_rows:
                     r_pk_col = get_pk_column(conn, fk.to_table) or r_cols[0]
@@ -341,6 +344,7 @@ def build_observation(
             _merge(obs.related, fk.from_table, r_cols, r_rows)
             if r_rows:
                 _mark_related_kind(obs.related_kind, fk.from_table, "in")
+                _mark_related_via(obs.related_via, fk.from_table, cur_table)
 
             for r_row in r_rows:
                 r_pk_col = get_pk_column(conn, fk.from_table) or r_cols[0]
@@ -354,6 +358,7 @@ def build_observation(
     # seed не должен дублироваться в related
     obs.related.pop(table, None)
     obs.related_kind.pop(table, None)
+    obs.related_via.pop(table, None)
     
     # Final SQL sort for merged sets to guarantee correctness
     for tbl in list(obs.related.keys()):
@@ -371,6 +376,10 @@ def _mark_related_kind(kind_store: dict[str, str], table: str, kind: str) -> Non
         kind_store[table] = kind
     elif prev != kind:
         kind_store[table] = "both"
+
+
+def _mark_related_via(via_store: dict[str, set[str]], table: str, via_table: str) -> None:
+    via_store.setdefault(table, set()).add(via_table)
 
 
 def _apply_seed_anchor(
@@ -475,14 +484,24 @@ SEED_STYLE = "bold cyan"
 REL_STYLE  = "bold yellow"
 
 
-def _relation_visual(kind: str) -> tuple[str, str, str]:
+def _relation_visual(kind: str) -> tuple[str, str]:
     if kind == "out":
-        return "▶", "bold yellow", "(на что ссылается)"
+        return "▶", "bold yellow"
     if kind == "in":
-        return "◀", "bold magenta", "(кто ссылается)"
+        return "◀", "bold magenta"
     if kind == "both":
-        return "◀▶", "bold green", "(в обе стороны)"
-    return "◆", REL_STYLE, ""
+        return "◀▶", "bold green"
+    return "◆", REL_STYLE
+
+
+def _via_text(via_tables: set[str] | None) -> str:
+    if not via_tables:
+        return ""
+    tables = sorted(via_tables)
+    if len(tables) > 4:
+        shown = ", ".join(tables[:4])
+        return f" [dim]via: {shown}, +{len(tables)-4}[/dim]"
+    return f" [dim]via: {', '.join(tables)}[/dim]"
 
 def _fmt(v: Any) -> str:
     return str(v) if v is not None else "NULL"
@@ -624,6 +643,7 @@ class TableBlock(Static):
                  fk_cols: dict[str, FKInfo] | None = None,
                  schema: Schema | None = None,
                  relation_kind: str = "",
+                 relation_via: set[str] | None = None,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.tbl_name  = table
@@ -632,19 +652,20 @@ class TableBlock(Static):
         self.is_seed   = is_seed
         self.schema    = schema
         self.relation_kind = relation_kind
+        self.relation_via = set(relation_via or set())
         self._pk_cols: set[str]          = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         self._flasher = RowFlasher()
 
     def compose(self) -> ComposeResult:
         if self.is_seed:
-            color, marker, role = SEED_STYLE, "●", "(seed)"
+            color, marker = SEED_STYLE, "●"
         else:
-            marker, color, role = _relation_visual(self.relation_kind)
+            marker, color = _relation_visual(self.relation_kind)
         tag = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
-        role_tag = "" if self.is_seed or not role else f" [dim]{role}[/dim]"
+        via_tag = "" if self.is_seed else _via_text(self.relation_via)
         yield Label(
-            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{role_tag}",
+            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{via_tag}",
             id=f"lbl-{self.id}",
         )
         dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="cell")
@@ -694,17 +715,21 @@ class TableBlock(Static):
         self.relation_kind = relation_kind
         self._refresh_label()
 
+    def set_relation_via(self, relation_via: set[str] | None) -> None:
+        self.relation_via = set(relation_via or set())
+        self._refresh_label()
+
     def _refresh_label(self) -> None:
         if self.is_seed:
-            color, marker, role = SEED_STYLE, "●", "(seed)"
+            color, marker = SEED_STYLE, "●"
         else:
-            marker, color, role = _relation_visual(self.relation_kind)
+            marker, color = _relation_visual(self.relation_kind)
         tag    = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
-        role_tag = "" if self.is_seed or not role else f" [dim]{role}[/dim]"
+        via_tag = "" if self.is_seed else _via_text(self.relation_via)
         new_cnt = self._flasher.count()
         new_tag = f"  [bold green]+{new_cnt} new[/bold green]" if new_cnt else ""
         self._lbl().update(
-            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{role_tag}{new_tag}"
+            f"[{color}]{marker} {self.tbl_name}[/]  [dim]{tag}[/dim]{via_tag}{new_tag}"
         )
 
 
@@ -1375,6 +1400,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                         fk_cols=_fk,
                         schema=self._schema,
                         relation_kind=obs.related_kind.get(tbl_name, ""),
+                        relation_via=obs.related_via.get(tbl_name, set()),
                         id=f"block-{bid}",
                         classes="obs-block",
                     )
@@ -1498,6 +1524,7 @@ class ObservationScreen(RuKeysMixin, Screen):
             if tbl_name in self._blocks:
                 self._blocks[tbl_name].refresh_col_meta(self._conn)
                 self._blocks[tbl_name].set_relation_kind(obs.related_kind.get(tbl_name, ""))
+                self._blocks[tbl_name].set_relation_via(obs.related_via.get(tbl_name, set()))
                 self._blocks[tbl_name].update_rows(rows)
             else:
                 _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
@@ -1505,6 +1532,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                     table=tbl_name, cols=cols, rows=rows,
                     is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
                     relation_kind=obs.related_kind.get(tbl_name, ""),
+                    relation_via=obs.related_via.get(tbl_name, set()),
                     id=f"block-{tbl_name}", classes="obs-block",
                 )
                 self._blocks[tbl_name] = blk
@@ -1553,6 +1581,8 @@ class ObservationScreen(RuKeysMixin, Screen):
             if real_tbl == self._obs.seed_table:
                 blk.update_rows([self._obs.seed_row] if self._obs.seed_row else [])
             elif real_tbl in self._obs.related:
+                blk.set_relation_kind(self._obs.related_kind.get(real_tbl, ""))
+                blk.set_relation_via(self._obs.related_via.get(real_tbl, set()))
                 blk.update_rows(self._obs.related[real_tbl][1])
 
     @on(DataTable.CellSelected)
@@ -1645,6 +1675,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                     blk.update_rows([new_obs.seed_row] if new_obs.seed_row else [])
                 else:
                     blk.set_relation_kind(new_obs.related_kind.get(real_tbl, ""))
+                    blk.set_relation_via(new_obs.related_via.get(real_tbl, set()))
                     blk.update_rows(new_obs.related[real_tbl][1])
             else:
                 # новая таблица появилась - создаём блок и монтируем
@@ -1659,6 +1690,7 @@ class ObservationScreen(RuKeysMixin, Screen):
                     fk_cols=_fk,
                     schema=self._schema,
                     relation_kind=new_obs.related_kind.get(real_tbl, ""),
+                    relation_via=new_obs.related_via.get(real_tbl, set()),
                     id=f"block-{bid}",
                     classes="obs-block",
                 )
