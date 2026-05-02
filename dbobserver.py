@@ -262,38 +262,48 @@ def build_observation(
 
     obs = Observation(seed_table=table, seed_row=seed_row, seed_cols=cols)
 
-    # BFS по графу FK-связей.
-    # visited: set of (table, pk_col, pk_val) - предотвращает рекурсию.
-    # queue: list of (tbl, row_dict, cols) - строки, которые нужно раскрыть.
+    # BFS strategy:
+    #
+    # "Down" direction (parent → children, via fk_to):
+    #   Records that reference the current row are collected and enqueued
+    #   for further expansion — we want all descendants.
+    #
+    # "Up" direction (child → parent, via fk_from):
+    #   Direct parents of a row are collected for context, but they are
+    #   NOT enqueued for further expansion.  This prevents the BFS from
+    #   walking to sibling records (e.g. another customer reached via
+    #   address.billing_customer_id) and pulling in all their subtrees.
+    #
+    # visited: set of (table, pk_col, pk_val) — prevents duplicate processing.
+    # queue:   list of (tbl, row_dict, cols) — rows pending expansion.
+    # queue items: (tbl, row_dict, cols, is_seed)
+    # is_seed=True  — row may be expanded both UP and DOWN
+    # is_seed=False — row is expanded DOWN only; UP-parents are not collected
+    #                  (prevents dragging in sibling records from parent tables)
     visited: set[tuple] = set()
-    queue: list[tuple[str, dict, list[str]]] = []
+    queue: list[tuple[str, dict, list[str], bool]] = []
 
     seed_dict = dict(zip(cols, seed_row))
     visited.add((table, pk_col, pk_val))
-    queue.append((table, seed_dict, cols))
+    queue.append((table, seed_dict, cols, True))
 
     while queue:
-        cur_table, cur_dict, cur_cols = queue.pop(0)
+        cur_table, cur_dict, cur_cols, is_seed_row = queue.pop(0)
 
-        # ── FK from cur_table → parent tables ──────────────────────────
-        for fk in schema.fk_from.get(cur_table, []):
-            fk_val = cur_dict.get(fk.from_col)
-            if fk_val is None:
-                continue
-            sort_info = schema.sort_prefs.get(fk.to_table)
-            r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val, sort_info)
-            _merge(obs.related, fk.to_table, r_cols, r_rows)
-            # enqueue newly discovered rows
-            for r_row in r_rows:
-                r_pk_col = get_pk_column(conn, fk.to_table) or r_cols[0]
-                r_dict = dict(zip(r_cols, r_row))
-                r_pk_val = r_dict.get(r_pk_col, r_row[0])
-                key = (fk.to_table, r_pk_col, r_pk_val)
-                if key not in visited:
-                    visited.add(key)
-                    queue.append((fk.to_table, r_dict, r_cols))
+        # ── UP: FK from cur_table → parent tables ──────────────────────
+        # Only done for the seed row. For descendant rows we skip UP-traversal
+        # entirely so that we never pull in unrelated sibling subtrees.
+        if is_seed_row:
+            for fk in schema.fk_from.get(cur_table, []):
+                fk_val = cur_dict.get(fk.from_col)
+                if fk_val is None:
+                    continue
+                sort_info = schema.sort_prefs.get(fk.to_table)
+                r_cols, r_rows = fetch_related_rows(conn, fk.to_table, fk.to_col, fk_val, sort_info)
+                _merge(obs.related, fk.to_table, r_cols, r_rows)
+                # Parent rows shown for context only — NOT enqueued.
 
-        # ── FK pointing to cur_table → child tables ─────────────────────
+        # ── DOWN: FK pointing to cur_table → child tables (enqueue) ───
         for fk in schema.fk_to.get(cur_table, []):
             ref_val = cur_dict.get(fk.to_col)
             if ref_val is None:
@@ -308,7 +318,7 @@ def build_observation(
                 key = (fk.from_table, r_pk_col, r_pk_val)
                 if key not in visited:
                     visited.add(key)
-                    queue.append((fk.from_table, r_dict, r_cols))
+                    queue.append((fk.from_table, r_dict, r_cols, False))
 
     # seed не должен дублироваться в related
     obs.related.pop(table, None)
@@ -745,6 +755,10 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
         tbl_name: str | None = None,
         pk_cols:  set[str] | None = None,
         fk_cols:  "dict[str, FKInfo] | None" = None,
+        # context of the seed row that produced this table (for filtered live polling)
+        seed_table: str | None = None,
+        seed_pk_col: str | None = None,
+        seed_pk_val: Any = None,
     ) -> None:
         super().__init__()
         self._title    = title
@@ -756,6 +770,10 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
         self._pk_cols: set[str]          = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         self._timer: Timer | None = None
+        # seed context – used by _poll to fetch only related rows
+        self._seed_table   = seed_table
+        self._seed_pk_col  = seed_pk_col
+        self._seed_pk_val  = seed_pk_val
         # set of rows already shown (for diff highlighting)
         self._known_rows: set[tuple] = set(rows)
         self._flasher = RowFlasher()
@@ -838,7 +856,23 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
         if self._conn is None or self._tbl_name is None:
             return
         try:
-            _, all_rows = fetch_all_rows(self._conn, self._tbl_name)
+            # If we have seed context – fetch only the rows that are related
+            # to the original seed row (same filtering as ObservationScreen).
+            # Fall back to fetch_all_rows only when context is unavailable
+            # (e.g. the screen was opened directly, not from ObservationScreen).
+            if self._seed_table and self._seed_pk_col and self._seed_pk_val is not None:
+                new_obs = build_observation(
+                    self._conn, self._schema,
+                    self._seed_table, self._seed_pk_col, self._seed_pk_val,
+                )
+                if self._tbl_name == self._seed_table:
+                    related_rows = [new_obs.seed_row] if new_obs.seed_row else []
+                else:
+                    related_rows = new_obs.related.get(self._tbl_name, (self._cols, []))[1]
+                all_rows = related_rows
+            else:
+                sort_info = self._schema.sort_prefs.get(self._tbl_name) if self._schema else None
+                _, all_rows = fetch_all_rows(self._conn, self._tbl_name, sort_info)
         except Exception:
             return
 
@@ -847,7 +881,7 @@ class ExpandedTableScreen(RuKeysMixin, ModalScreen):
             for row in new_rows:
                 self._known_rows.add(row)
                 self._flasher.add(str(row))
-            
+
             self._rows = all_rows
             self._redraw_dt()
             self._refresh_title()
@@ -1210,6 +1244,10 @@ class ObservationScreen(RuKeysMixin, Screen):
                 tbl_name=target_block.tbl_name,
                 pk_cols=_pk,
                 fk_cols=_fk,
+                # seed context so live polling only shows related rows
+                seed_table=self._table,
+                seed_pk_col=self._pk_col,
+                seed_pk_val=self._pk_val,
             )
         )
 
