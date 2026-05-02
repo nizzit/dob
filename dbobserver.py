@@ -1677,10 +1677,16 @@ class ObservationScreen(RuKeysMixin, Screen):
                 self._blocks[tbl_name] = blk
                 scroll.mount(blk)
 
-    def on_mount(self) -> None:
+    def _sync_live_from_app(self) -> None:
         self.live = _app_live_get(self.app, self._table)
+
+    def on_mount(self) -> None:
+        self._sync_live_from_app()
         # give keyboard focus to scroll container so arrow keys work
         self.query_one("#obs-scroll").focus()
+
+    def on_screen_resume(self) -> None:
+        self._sync_live_from_app()
 
     def on_unmount(self) -> None:
         if self._timer:
@@ -1937,10 +1943,16 @@ class RowPickerScreen(RuKeysMixin, Screen):
         self._reload()
         self.query_one("#row-table", DataTable).focus()
 
+    def _sync_live_from_app(self) -> None:
+        self.live = _app_live_get(self.app, self.table)
+
     def on_mount(self) -> None:
         self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
-        self.live = _app_live_get(self.app, self.table)
+        self._sync_live_from_app()
         self.query_one("#row-table", DataTable).focus()
+
+    def on_screen_resume(self) -> None:
+        self._sync_live_from_app()
 
     def on_unmount(self) -> None:
         self.app.sub_title = ""
