@@ -15,15 +15,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual import events
 from textual.containers import Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
@@ -39,7 +38,7 @@ from textual.widgets import (
     Static,
 )
 
-LIVE_INTERVAL = 2.0   # seconds between polls in live mode
+LIVE_INTERVAL = 2.0  # seconds between polls in live mode
 
 # ─────────────────────────────────────────────
 # DB helpers
@@ -52,17 +51,22 @@ class FKInfo:
     from_col: str
     to_table: str
     to_col: str
-    virtual: bool = False   # True - вручную заданная связь
+    virtual: bool = False  # True - вручную заданная связь
 
 
 @dataclass
 class Schema:
     tables: list[str]
-    fk_from:   dict[str, list[FKInfo]] = field(default_factory=dict)
-    fk_to:     dict[str, list[FKInfo]] = field(default_factory=dict)
-    db_path:   str = ""                 # путь к .db для VirtualLinks
+    fk_from: dict[str, list[FKInfo]] = field(default_factory=dict)
+    fk_to: dict[str, list[FKInfo]] = field(default_factory=dict)
+    db_path: str = ""  # путь к .db для VirtualLinks
     col_cache: dict[str, list[str]] = field(default_factory=dict)  # table→cols
-    sort_prefs: dict[str, tuple[str, bool]] = field(default_factory=dict) # table→(col, reverse)
+    sort_prefs: dict[str, tuple[str, bool]] = field(
+        default_factory=dict
+    )  # table→(col, reverse)
+    filter_prefs: dict[str, tuple[str, Any]] = field(
+        default_factory=dict
+    )  # table→(col, value)
 
 
 def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
@@ -74,6 +78,11 @@ def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
     if db_path:
         data = ProjectSettings.load(db_path)
         schema.sort_prefs = {k: (v[0], bool(v[1])) for k, v in data["sorts"].items()}
+        schema.filter_prefs = {
+            k: (v[0], v[1])
+            for k, v in data.get("filters", {}).items()
+            if isinstance(v, (list, tuple)) and len(v) == 2
+        }
 
     # cache column names for each table
     for table in tables:
@@ -84,8 +93,9 @@ def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
         schema.fk_from[table] = []
         cur.execute(f"PRAGMA foreign_key_list('{table}')")
         for row in cur.fetchall():
-            fk = FKInfo(from_table=table, from_col=row[3],
-                        to_table=row[2],  to_col=row[4])
+            fk = FKInfo(
+                from_table=table, from_col=row[3], to_table=row[2], to_col=row[4]
+            )
             schema.fk_from[table].append(fk)
 
     for table in tables:
@@ -100,11 +110,26 @@ def load_schema(conn: sqlite3.Connection, db_path: str = "") -> Schema:
     return schema
 
 
-def fetch_all_rows(conn: sqlite3.Connection, table: str, sort_info: tuple[str, bool] | None = None) -> tuple[list[str], list[tuple]]:
+def fetch_all_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    sort_info: tuple[str, bool] | None = None,
+    filter_info: tuple[str, Any] | None = None,
+) -> tuple[list[str], list[tuple]]:
     cur = conn.cursor()
-    cur.execute(f'SELECT * FROM "{table}"{_order_clause(sort_info)}')
+    where_sql = ""
+    params: list[Any] = []
+    if filter_info:
+        col, val = filter_info
+        if val is None:
+            where_sql = f' WHERE "{col}" IS NULL'
+        else:
+            where_sql = f' WHERE "{col}" = ?'
+            params.append(val)
+    cur.execute(f'SELECT * FROM "{table}"{where_sql}{_order_clause(sort_info)}', params)
     cols = [d[0] for d in cur.description]
     return cols, cur.fetchall()
+
 
 def fetch_row_by_pk(
     conn: sqlite3.Connection, table: str, pk_col: str, pk_val: Any
@@ -187,10 +212,17 @@ def fetch_lookup_value(conn: sqlite3.Connection, table: str, id_val: Any) -> Any
 
 
 def fetch_related_rows(
-    conn: sqlite3.Connection, table: str, fk_col: str, fk_val: Any, sort_info: tuple[str, bool] | None = None
+    conn: sqlite3.Connection,
+    table: str,
+    fk_col: str,
+    fk_val: Any,
+    sort_info: tuple[str, bool] | None = None,
 ) -> tuple[list[str], list[tuple]]:
     cur = conn.cursor()
-    cur.execute(f'SELECT * FROM "{table}" WHERE "{fk_col}" = ?{_order_clause(sort_info)}', (fk_val,))
+    cur.execute(
+        f'SELECT * FROM "{table}" WHERE "{fk_col}" = ?{_order_clause(sort_info)}',
+        (fk_val,),
+    )
     cols = [d[0] for d in cur.description]
     return cols, cur.fetchall()
 
@@ -215,7 +247,7 @@ def fetch_related_rows_in(
     # Conservative chunk to stay below SQLite variable limits.
     chunk_size = 900
     for i in range(0, len(unique_vals), chunk_size):
-        chunk = unique_vals[i:i + chunk_size]
+        chunk = unique_vals[i : i + chunk_size]
         placeholders = ",".join("?" for _ in chunk)
         cur.execute(
             f'SELECT * FROM "{table}" WHERE "{fk_col}" IN ({placeholders}){_order_clause(sort_info)}',
@@ -232,12 +264,14 @@ def fetch_related_rows_in(
 # Project Settings (Links & Sorts)
 # ─────────────────────────────────────────────
 
+
 class ProjectSettings:
     """
     Persists user-defined settings in <db>.dbobserver.json.
     Format: {
         "links": [ {from_table, from_col, to_table, to_col}, ... ],
-        "sorts": { "table_name": ["col_name", reverse_bool], ... }
+        "sorts": { "table_name": ["col_name", reverse_bool], ... },
+        "filters": { "table_name": ["col_name", value], ... }
     }
     """
 
@@ -249,20 +283,23 @@ class ProjectSettings:
     def load(cls, db_path: str) -> dict:
         p = cls._path(db_path)
         if not p.exists():
-            return {"links": [], "sorts": {}}
+            return {"links": [], "sorts": {}, "filters": {}}
         try:
             data = json.loads(p.read_text())
             return {
                 "links": data.get("links", []),
-                "sorts": data.get("sorts", {})
+                "sorts": data.get("sorts", {}),
+                "filters": data.get("filters", {}),
             }
         except Exception:
-            return {"links": [], "sorts": {}}
+            return {"links": [], "sorts": {}, "filters": {}}
 
     @classmethod
     def save(cls, db_path: str, data: dict) -> None:
-        if not db_path: return
+        if not db_path:
+            return
         cls._path(db_path).write_text(json.dumps(data, indent=2))
+
 
 class VirtualLinks:
     """
@@ -270,21 +307,25 @@ class VirtualLinks:
     """
 
     @classmethod
-    def add(cls, db_path: str, from_table: str, from_col: str,
-            to_table: str, to_col: str) -> None:
+    def add(
+        cls, db_path: str, from_table: str, from_col: str, to_table: str, to_col: str
+    ) -> None:
         data = ProjectSettings.load(db_path)
-        entry = dict(from_table=from_table, from_col=from_col,
-                     to_table=to_table,   to_col=to_col)
+        entry = dict(
+            from_table=from_table, from_col=from_col, to_table=to_table, to_col=to_col
+        )
         if entry not in data["links"]:
             data["links"].append(entry)
             ProjectSettings.save(db_path, data)
 
     @classmethod
-    def remove(cls, db_path: str, from_table: str, from_col: str,
-               to_table: str, to_col: str) -> None:
+    def remove(
+        cls, db_path: str, from_table: str, from_col: str, to_table: str, to_col: str
+    ) -> None:
         data = ProjectSettings.load(db_path)
-        entry = dict(from_table=from_table, from_col=from_col,
-                     to_table=to_table,   to_col=to_col)
+        entry = dict(
+            from_table=from_table, from_col=from_col, to_table=to_table, to_col=to_col
+        )
         data["links"] = [ln for ln in data["links"] if ln != entry]
         ProjectSettings.save(db_path, data)
 
@@ -293,19 +334,19 @@ class VirtualLinks:
         """Add virtual FKInfo entries to an already-loaded Schema in-place."""
         if not schema.db_path:
             return
-        
+
         data = ProjectSettings.load(schema.db_path)
         for entry in data["links"]:
             ft, fc = entry["from_table"], entry["from_col"]
-            tt, tc = entry["to_table"],   entry["to_col"]
+            tt, tc = entry["to_table"], entry["to_col"]
             if ft not in schema.fk_from:
                 schema.fk_from[ft] = []
             if tt not in schema.fk_to:
                 schema.fk_to[tt] = []
-            fk = FKInfo(from_table=ft, from_col=fc,
-                        to_table=tt,  to_col=tc, virtual=True)
-            existing = {(f.from_col, f.to_table, f.to_col)
-                        for f in schema.fk_from[ft]}
+            fk = FKInfo(
+                from_table=ft, from_col=fc, to_table=tt, to_col=tc, virtual=True
+            )
+            existing = {(f.from_col, f.to_table, f.to_col) for f in schema.fk_from[ft]}
             if (fc, tt, tc) not in existing:
                 schema.fk_from[ft].append(fk)
                 schema.fk_to[tt].append(fk)
@@ -318,21 +359,39 @@ def toggle_and_save_sort(schema: Schema, table: str, col_name: str) -> None:
     else:
         new_sort = (col_name, True)  # первое нажатие → по убыванию
     schema.sort_prefs[table] = new_sort
-    
+
     data = ProjectSettings.load(schema.db_path)
     data["sorts"] = schema.sort_prefs
     ProjectSettings.save(schema.db_path, data)
+
+
+def set_and_save_filter(schema: Schema, table: str, col_name: str, value: Any) -> None:
+    schema.filter_prefs[table] = (col_name, value)
+    data = ProjectSettings.load(schema.db_path)
+    data["filters"] = schema.filter_prefs
+    ProjectSettings.save(schema.db_path, data)
+
+
+def clear_and_save_filter(schema: Schema, table: str) -> None:
+    if table in schema.filter_prefs:
+        schema.filter_prefs.pop(table, None)
+        data = ProjectSettings.load(schema.db_path)
+        data["filters"] = schema.filter_prefs
+        ProjectSettings.save(schema.db_path, data)
+
 
 # ─────────────────────────────────────────────
 # Graph traversal
 # ─────────────────────────────────────────────
 
+
 @dataclass
 class Observation:
     """All rows gathered starting from a seed row."""
+
     seed_table: str
-    seed_row:   tuple
-    seed_cols:  list[str]
+    seed_row: tuple
+    seed_cols: list[str]
     # table → (columns, rows)
     related: dict[str, tuple[list[str], list[tuple]]] = field(default_factory=dict)
     # table → relation kind relative to traversal:
@@ -399,13 +458,21 @@ def build_observation(
                 if fk.to_table == obs.seed_table:
                     continue
 
-                fk_vals = [d.get(fk.from_col) for d, allow in items if allow and d.get(fk.from_col) is not None]
+                fk_vals = [
+                    d.get(fk.from_col)
+                    for d, allow in items
+                    if allow and d.get(fk.from_col) is not None
+                ]
                 if not fk_vals:
                     continue
 
                 sort_info = schema.sort_prefs.get(fk.to_table)
-                r_cols, r_rows = fetch_related_rows_in(conn, fk.to_table, fk.to_col, fk_vals, sort_info)
-                r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.to_table, r_cols, r_rows)
+                r_cols, r_rows = fetch_related_rows_in(
+                    conn, fk.to_table, fk.to_col, fk_vals, sort_info
+                )
+                r_rows = _apply_seed_anchor(
+                    schema, obs.seed_table, seed_dict, fk.to_table, r_cols, r_rows
+                )
                 _merge(obs.related, fk.to_table, r_cols, r_rows)
                 if r_rows:
                     _mark_related_kind(obs.related_kind, fk.to_table, "out")
@@ -427,13 +494,21 @@ def build_observation(
                 if fk.from_table == obs.seed_table:
                     continue
 
-                ref_vals = [d.get(fk.to_col) for d, _allow in items if d.get(fk.to_col) is not None]
+                ref_vals = [
+                    d.get(fk.to_col)
+                    for d, _allow in items
+                    if d.get(fk.to_col) is not None
+                ]
                 if not ref_vals:
                     continue
 
                 sort_info = schema.sort_prefs.get(fk.from_table)
-                r_cols, r_rows = fetch_related_rows_in(conn, fk.from_table, fk.from_col, ref_vals, sort_info)
-                r_rows = _apply_seed_anchor(schema, obs.seed_table, seed_dict, fk.from_table, r_cols, r_rows)
+                r_cols, r_rows = fetch_related_rows_in(
+                    conn, fk.from_table, fk.from_col, ref_vals, sort_info
+                )
+                r_rows = _apply_seed_anchor(
+                    schema, obs.seed_table, seed_dict, fk.from_table, r_cols, r_rows
+                )
                 _merge(obs.related, fk.from_table, r_cols, r_rows)
                 if r_rows:
                     _mark_related_kind(obs.related_kind, fk.from_table, "in")
@@ -452,7 +527,7 @@ def build_observation(
     obs.related.pop(table, None)
     obs.related_kind.pop(table, None)
     obs.related_via.pop(table, None)
-    
+
     # Final SQL sort for merged sets to guarantee correctness
     for tbl in list(obs.related.keys()):
         cols, rows = obs.related[tbl]
@@ -471,7 +546,9 @@ def _mark_related_kind(kind_store: dict[str, str], table: str, kind: str) -> Non
         kind_store[table] = "both"
 
 
-def _mark_related_via(via_store: dict[str, set[str]], table: str, via_table: str) -> None:
+def _mark_related_via(
+    via_store: dict[str, set[str]], table: str, via_table: str
+) -> None:
     via_store.setdefault(table, set()).add(via_table)
 
 
@@ -492,8 +569,7 @@ def _apply_seed_anchor(
         return rows
 
     anchor_fks = [
-        fk for fk in schema.fk_from.get(target_table, [])
-        if fk.to_table == seed_table
+        fk for fk in schema.fk_from.get(target_table, []) if fk.to_table == seed_table
     ]
     if not anchor_fks:
         return rows
@@ -516,8 +592,8 @@ def _apply_seed_anchor(
 def _merge(
     store: dict[str, tuple[list[str], list[tuple]]],
     table: str,
-    cols:  list[str],
-    rows:  list[tuple],
+    cols: list[str],
+    rows: list[tuple],
 ) -> None:
     if not rows:
         return
@@ -536,11 +612,13 @@ def _merge(
 # Live diff: compare old vs new observation
 # ─────────────────────────────────────────────
 
+
 @dataclass
 class TableDiff:
     """New rows that appeared in one table since last poll."""
-    table:   str
-    cols:    list[str]
+
+    table: str
+    cols: list[str]
     new_rows: list[tuple]
 
 
@@ -559,11 +637,14 @@ def diff_observations(old: Observation, new: Observation) -> list[TableDiff]:
 
     # seed row change (update)
     if old.seed_row != new.seed_row and new.seed_row:
-        diffs.insert(0, TableDiff(
-            table=f"{new.seed_table} (seed updated)",
-            cols=new.seed_cols,
-            new_rows=[new.seed_row],
-        ))
+        diffs.insert(
+            0,
+            TableDiff(
+                table=f"{new.seed_table} (seed updated)",
+                cols=new.seed_cols,
+                new_rows=[new.seed_row],
+            ),
+        )
 
     return diffs
 
@@ -572,9 +653,9 @@ def diff_observations(old: Observation, new: Observation) -> list[TableDiff]:
 # Widgets
 # ─────────────────────────────────────────────
 
-NEW_STYLE  = "bold green"
+NEW_STYLE = "bold green"
 SEED_STYLE = "bold cyan"
-REL_STYLE  = "bold yellow"
+REL_STYLE = "bold yellow"
 
 
 def _direction_tag(kind: str) -> str:
@@ -593,13 +674,43 @@ def _via_text(via_tables: set[str] | None) -> str:
     tables = sorted(via_tables)
     if len(tables) > 4:
         shown = ", ".join(tables[:4])
-        return f" [dim]via: {shown}, +{len(tables)-4}[/dim]"
+        return f" [dim]via: {shown}, +{len(tables) - 4}[/dim]"
     return f" [dim]via: {', '.join(tables)}[/dim]"
+
 
 def _fmt(v: Any) -> str:
     return str(v) if v is not None else "NULL"
 
-def _row_strs(row: tuple, inline_map: dict[int, tuple[str, Any]] | None = None) -> list[str]:
+
+def _parse_filter_value(raw: str) -> Any:
+    text = raw.strip()
+    if text.upper() == "NULL":
+        return None
+    if text == "":
+        return ""
+    if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+        try:
+            return int(text)
+        except Exception:
+            pass
+    try:
+        if any(ch in text for ch in (".", "e", "E")):
+            return float(text)
+    except Exception:
+        pass
+    return text
+
+
+def _filter_caption(filter_info: tuple[str, Any] | None) -> str:
+    if not filter_info:
+        return ""
+    col, val = filter_info
+    return f"  filter: {col} = {_fmt(val)}"
+
+
+def _row_strs(
+    row: tuple, inline_map: dict[int, tuple[str, Any]] | None = None
+) -> list[str]:
     inline_map = inline_map or {}
     out: list[str] = []
     for i, v in enumerate(row):
@@ -612,25 +723,39 @@ def _row_strs(row: tuple, inline_map: dict[int, tuple[str, Any]] | None = None) 
             out.append(base)
     return out
 
+
 def _order_clause(sort_info: tuple[str, bool] | None) -> str:
     if not sort_info:
         return ""
     return f' ORDER BY "{sort_info[0]}" {"DESC" if sort_info[1] else "ASC"}'
 
-def sql_sort_rows(conn: sqlite3.Connection, table: str, cols: list[str], rows: list[tuple], sort_info: tuple[str, bool] | None) -> list[tuple]:
-    if not sort_info or not rows: return rows
+
+def sql_sort_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    cols: list[str],
+    rows: list[tuple],
+    sort_info: tuple[str, bool] | None,
+) -> list[tuple]:
+    if not sort_info or not rows:
+        return rows
     pk_col = get_pk_column(conn, table)
-    if not pk_col: return rows
+    if not pk_col:
+        return rows
     try:
         pk_idx = cols.index(pk_col)
         pk_vals = [r[pk_idx] for r in rows]
         placeholders = ",".join("?" for _ in pk_vals)
         cur = conn.cursor()
-        cur.execute(f'SELECT * FROM "{table}" WHERE "{pk_col}" IN ({placeholders}){_order_clause(sort_info)}', pk_vals)
+        cur.execute(
+            f'SELECT * FROM "{table}" WHERE "{pk_col}" IN ({placeholders}){_order_clause(sort_info)}',
+            pk_vals,
+        )
         res = cur.fetchall()
         return res if len(res) == len(rows) else rows
     except Exception:
         return rows
+
 
 def _mark_row(dt: DataTable, key: str, new: bool) -> None:
     """Prefix first cell with ▶ marker for new rows."""
@@ -642,6 +767,7 @@ def _mark_row(dt: DataTable, key: str, new: bool) -> None:
         dt.update_cell(key, dt.ordered_columns[0].key, val)
     except Exception:
         pass
+
 
 def update_live_label(lbl: Label | None, is_live: bool, extra: str = "") -> None:
     if lbl is None:
@@ -674,10 +800,10 @@ def _app_live_set(app: App, table: str | None, value: bool) -> None:
 class RowFlasher:
     def __init__(self) -> None:
         self._flash: dict[str, int] = {}
-        
+
     def add(self, key: str) -> None:
         self._flash[key] = 3
-        
+
     def tick(self, dt: DataTable) -> None:
         if not self._flash:
             return
@@ -687,10 +813,10 @@ class RowFlasher:
             del self._flash[key]
         for key in self._flash:
             self._flash[key] -= 1
-            
+
     def count(self) -> int:
         return len(self._flash)
-        
+
     def clear(self) -> None:
         self._flash.clear()
 
@@ -716,10 +842,11 @@ def _build_col_meta(
 
 
 def _col_header(
-    col: str, 
-    pk_cols: set[str], 
-    fk_cols: dict[str, FKInfo], 
-    sort_info: tuple[str, bool] | None = None
+    col: str,
+    pk_cols: set[str],
+    fk_cols: dict[str, FKInfo],
+    sort_info: tuple[str, bool] | None = None,
+    filter_info: tuple[str, Any] | None = None,
 ) -> str:
     """
     Return a column header string with relationship indicators:
@@ -727,6 +854,7 @@ def _col_header(
       🔗 Real FK to another table
       ✨ Virtual (user-defined) link
       ↑↓ Sort indicator
+      ◉ Active filter column
     Multiple indicators are stacked (e.g. 🔑🔗 for FK that is also PK).
     """
     if col in pk_cols:
@@ -745,7 +873,9 @@ def _col_header(
 
     suffix = ""
     if sort_info and sort_info[0] == col:
-        suffix = " [bold]↓[/bold]" if sort_info[1] else " [bold]↑[/bold]"
+        suffix += " [bold]↓[/bold]" if sort_info[1] else " [bold]↑[/bold]"
+    if filter_info and filter_info[0] == col:
+        suffix += " [bold magenta]◉[/bold magenta]"
 
     if pk_prefix or fk_prefix:
         return f"{pk_prefix}{fk_prefix}{col}{suffix}"
@@ -789,25 +919,30 @@ class TableBlock(Static):
     Supports adding new rows with a flash highlight.
     """
 
-    def __init__(self, table: str, cols: list[str], rows: list[tuple],
-                 is_seed: bool = False,
-                 pk_cols: set[str] | None = None,
-                 fk_cols: dict[str, FKInfo] | None = None,
-                 schema: Schema | None = None,
-                 conn: sqlite3.Connection | None = None,
-                 relation_kind: str = "",
-                 relation_via: set[str] | None = None,
-                 **kwargs) -> None:
+    def __init__(
+        self,
+        table: str,
+        cols: list[str],
+        rows: list[tuple],
+        is_seed: bool = False,
+        pk_cols: set[str] | None = None,
+        fk_cols: dict[str, FKInfo] | None = None,
+        schema: Schema | None = None,
+        conn: sqlite3.Connection | None = None,
+        relation_kind: str = "",
+        relation_via: set[str] | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
-        self.tbl_name  = table
-        self.cols      = cols
-        self.all_rows  = list(rows)
-        self.is_seed   = is_seed
-        self.schema    = schema
-        self._conn     = conn
+        self.tbl_name = table
+        self.cols = cols
+        self.all_rows = list(rows)
+        self.is_seed = is_seed
+        self.schema = schema
+        self._conn = conn
         self.relation_kind = relation_kind
         self.relation_via = set(relation_via or set())
-        self._pk_cols: set[str]          = pk_cols or set()
+        self._pk_cols: set[str] = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         self._flasher = RowFlasher()
 
@@ -824,21 +959,31 @@ class TableBlock(Static):
             id=f"lbl-{self.id}",
         )
         dt = DataTable(zebra_stripes=True, id=f"dt-{self.id}", cursor_type="cell")
-        
+
         sort_info = self.schema.sort_prefs.get(self.tbl_name) if self.schema else None
-        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self.cols]
+        filter_info = (
+            self.schema.filter_prefs.get(self.tbl_name) if self.schema else None
+        )
+        headers = [
+            _col_header(c, self._pk_cols, self._fk_cols, sort_info, filter_info)
+            for c in self.cols
+        ]
         dt.add_columns(*headers)
         for row in self.all_rows:
             inline_map = {}
             if self.schema and self._conn:
-                inline_map = _build_inline_lookup_map(self._conn, self.schema, self.tbl_name, self.cols, row)
+                inline_map = _build_inline_lookup_map(
+                    self._conn, self.schema, self.tbl_name, self.cols, row
+                )
             dt.add_row(*_row_strs(row, inline_map), key=str(row))
         yield dt
 
     def refresh_col_meta(self, conn: sqlite3.Connection) -> None:
         """Re-read FK/PK metadata from schema (call after schema changes)."""
         if self.schema:
-            self._pk_cols, self._fk_cols = _build_col_meta(conn, self.schema, self.tbl_name)
+            self._pk_cols, self._fk_cols = _build_col_meta(
+                conn, self.schema, self.tbl_name
+            )
 
     def update_rows(self, rows: list[tuple]) -> None:
         """Replace all rows and completely redraw the data table."""
@@ -847,17 +992,25 @@ class TableBlock(Static):
         cur_r, cur_c = dt.cursor_row, dt.cursor_column
         dt.clear(columns=True)
         sort_info = self.schema.sort_prefs.get(self.tbl_name) if self.schema else None
-        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self.cols]
+        filter_info = (
+            self.schema.filter_prefs.get(self.tbl_name) if self.schema else None
+        )
+        headers = [
+            _col_header(c, self._pk_cols, self._fk_cols, sort_info, filter_info)
+            for c in self.cols
+        ]
         dt.add_columns(*headers)
         for row in self.all_rows:
             key = str(row)
             inline_map = {}
             if self.schema and self._conn:
-                inline_map = _build_inline_lookup_map(self._conn, self.schema, self.tbl_name, self.cols, row)
+                inline_map = _build_inline_lookup_map(
+                    self._conn, self.schema, self.tbl_name, self.cols, row
+                )
             dt.add_row(*_row_strs(row, inline_map), key=key)
             if key in self._flasher._flash:
                 _mark_row(dt, key, new=True)
-        dt.move_cursor(row=min(cur_r, max(0, len(self.all_rows)-1)), column=cur_c)
+        dt.move_cursor(row=min(cur_r, max(0, len(self.all_rows) - 1)), column=cur_c)
         self._refresh_label()
 
     def _dt(self) -> DataTable:
@@ -885,7 +1038,7 @@ class TableBlock(Static):
             color, marker = SEED_STYLE, "●"
         else:
             color, marker = REL_STYLE, "◆"
-        tag    = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
+        tag = "(seed)" if self.is_seed else f"({len(self.all_rows)} rows)"
         dir_tag = "" if self.is_seed else _direction_tag(self.relation_kind)
         via_tag = "" if self.is_seed else _via_text(self.relation_via)
         new_cnt = self._flasher.count()
@@ -898,6 +1051,7 @@ class TableBlock(Static):
 # ─────────────────────────────────────────────
 # Virtual-link manager modal
 # ─────────────────────────────────────────────
+
 
 class LinkManagerScreen(ModalScreen[bool]):
     """
@@ -913,20 +1067,21 @@ class LinkManagerScreen(ModalScreen[bool]):
 
     def __init__(
         self,
-        db_path:    str,
-        schema:     Schema,
+        db_path: str,
+        schema: Schema,
         from_table: str,
-        from_col:   str,
+        from_col: str,
     ) -> None:
         super().__init__()
-        self._db_path    = db_path
-        self._schema     = schema
+        self._db_path = db_path
+        self._schema = schema
         self._from_table = from_table
-        self._from_col   = from_col
-        self._changed    = False
+        self._from_col = from_col
+        self._changed = False
         # all virtual links from this column
         self._links: list[FKInfo] = [
-            fk for fk in schema.fk_from.get(from_table, [])
+            fk
+            for fk in schema.fk_from.get(from_table, [])
             if fk.virtual and fk.from_col == from_col
         ]
         # action items: (kind, label, fk|None)
@@ -946,7 +1101,8 @@ class LinkManagerScreen(ModalScreen[bool]):
     def _rebuild(self) -> None:
         # refresh links from schema
         self._links = [
-            fk for fk in self._schema.fk_from.get(self._from_table, [])
+            fk
+            for fk in self._schema.fk_from.get(self._from_table, [])
             if fk.virtual and fk.from_col == self._from_col
         ]
 
@@ -963,29 +1119,38 @@ class LinkManagerScreen(ModalScreen[bool]):
 
         # ── «create new» item ───────────────────────────
         self._items.append(("new", "", None))
-        lv.append(ListItem(
-            Label("[bold green]＋  Create new link[/bold green]"),
-            name="new",
-        ))
+        lv.append(
+            ListItem(
+                Label("[bold green]＋  Create new link[/bold green]"),
+                name="new",
+            )
+        )
 
         if self._links:
             # separator label (not selectable, but visually distinct)
-            lv.append(ListItem(Label("[dim]─── existing links ─────────────────────[/dim]"), name="_sep"))
+            lv.append(
+                ListItem(
+                    Label("[dim]─── existing links ─────────────────────[/dim]"),
+                    name="_sep",
+                )
+            )
             self._items.append(("_sep", "", None))
 
             for fk in self._links:
-                label_text = (
-                    f"[cyan]{fk.to_table}[/].[yellow]{fk.to_col}[/]"
-                )
+                label_text = f"[cyan]{fk.to_table}[/].[yellow]{fk.to_col}[/]"
                 # edit action
                 edit_label = f"[bold]✎[/bold]  {label_text}  [dim]edit[/dim]"
                 self._items.append(("edit", "", fk))
-                lv.append(ListItem(Label(edit_label), name=f"edit:{fk.to_table}:{fk.to_col}"))
+                lv.append(
+                    ListItem(Label(edit_label), name=f"edit:{fk.to_table}:{fk.to_col}")
+                )
 
                 # delete action
                 del_label = f"[bold red]✕[/bold red]  {label_text}  [dim]delete[/dim]"
                 self._items.append(("delete", "", fk))
-                lv.append(ListItem(Label(del_label), name=f"del:{fk.to_table}:{fk.to_col}"))
+                lv.append(
+                    ListItem(Label(del_label), name=f"del:{fk.to_table}:{fk.to_col}")
+                )
 
         lv.focus()
         lv.index = 0
@@ -995,7 +1160,7 @@ class LinkManagerScreen(ModalScreen[bool]):
         name = event.item.name or ""
 
         if name == "_sep":
-            return   # separator – ignore
+            return  # separator – ignore
 
         if name == "new":
             self._open_builder(edit_fk=None)
@@ -1024,8 +1189,10 @@ class LinkManagerScreen(ModalScreen[bool]):
     def _delete_link(self, fk: FKInfo) -> None:
         VirtualLinks.remove(
             self._db_path,
-            fk.from_table, fk.from_col,
-            fk.to_table, fk.to_col,
+            fk.from_table,
+            fk.from_col,
+            fk.to_table,
+            fk.to_col,
         )
         # remove from schema in-place
         self._schema.fk_from.get(fk.from_table, []).remove(fk)
@@ -1046,8 +1213,10 @@ class LinkManagerScreen(ModalScreen[bool]):
                     # delete the old link that was replaced
                     VirtualLinks.remove(
                         self._db_path,
-                        edit_fk.from_table, edit_fk.from_col,
-                        edit_fk.to_table, edit_fk.to_col,
+                        edit_fk.from_table,
+                        edit_fk.from_col,
+                        edit_fk.to_table,
+                        edit_fk.to_col,
                     )
                     try:
                         self._schema.fk_from.get(edit_fk.from_table, []).remove(edit_fk)
@@ -1079,6 +1248,7 @@ class LinkManagerScreen(ModalScreen[bool]):
 # Link builder modal
 # ─────────────────────────────────────────────
 
+
 class LinkBuilderScreen(ModalScreen[bool]):
     """
     Two-step wizard to create a virtual FK link.
@@ -1092,16 +1262,16 @@ class LinkBuilderScreen(ModalScreen[bool]):
 
     def __init__(
         self,
-        db_path:    str,
-        schema:     Schema,
+        db_path: str,
+        schema: Schema,
         from_table: str,
-        from_col:   str,
+        from_col: str,
     ) -> None:
         super().__init__()
-        self._db_path    = db_path
-        self._schema     = schema
+        self._db_path = db_path
+        self._schema = schema
         self._from_table = from_table
-        self._from_col   = from_col
+        self._from_col = from_col
         self._target_table: str | None = None
         self._step = 1
 
@@ -1157,12 +1327,23 @@ class LinkBuilderScreen(ModalScreen[bool]):
             for col in self._schema.col_cache.get(self._target_table, []):
                 if (self._target_table, col) in real_targets:
                     continue
-                badge = "  [dim green](✓ linked)[/dim green]" if (self._target_table, col) in virtual_targets else ""
+                badge = (
+                    "  [dim green](✓ linked)[/dim green]"
+                    if (self._target_table, col) in virtual_targets
+                    else ""
+                )
                 lv.append(ListItem(Label(f"[yellow]{col}[/]{badge}"), name=col))
                 shown += 1
 
             if shown == 0:
-                lv.append(ListItem(Label("[dim]No available columns (real FK already exists).[/dim]"), name="_none"))
+                lv.append(
+                    ListItem(
+                        Label(
+                            "[dim]No available columns (real FK already exists).[/dim]"
+                        ),
+                        name="_none",
+                    )
+                )
 
         lv.focus()
 
@@ -1195,10 +1376,45 @@ class LinkBuilderScreen(ModalScreen[bool]):
 
             VirtualLinks.add(
                 self._db_path,
-                self._from_table, self._from_col,
-                self._target_table, name,
+                self._from_table,
+                self._from_col,
+                self._target_table,
+                name,
             )
             self.dismiss(True)
+
+
+class FilterValueScreen(ModalScreen[str | None]):
+    """Prompt for a filter value. Empty value clears filter."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel", show=True)]
+
+    def __init__(self, table: str, column: str, current: Any = None) -> None:
+        super().__init__()
+        self._table = table
+        self._column = column
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield Label(
+            f"[bold cyan]Filter[/] [bold]{self._table}[/].[bold yellow]{self._column}[/]"
+            "  [dim](exact match, NULL supported)[/dim]"
+        )
+        placeholder = "value (empty = clear, NULL = IS NULL)"
+        yield Input(
+            value="" if self._current is None else str(self._current),
+            placeholder=placeholder,
+            id="filter-value-input",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#filter-value-input", Input).focus()
+
+    @on(Input.Submitted, "#filter-value-input")
+    def submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
 
 
 # ─────────────────────────────────────────────
@@ -1207,12 +1423,35 @@ class LinkBuilderScreen(ModalScreen[bool]):
 
 # Maps Russian ЙЦУКЕН keys to their English QWERTY equivalents
 _RU_TO_EN: dict[str, str] = {
-    "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t",
-    "н": "y", "г": "u", "ш": "i", "щ": "o", "з": "p",
-    "ф": "a", "ы": "s", "в": "d", "а": "f", "п": "g",
-    "р": "h", "о": "j", "л": "k", "д": "l",
-    "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b",
-    "т": "n", "ь": "m",
+    "й": "q",
+    "ц": "w",
+    "у": "e",
+    "к": "r",
+    "е": "t",
+    "н": "y",
+    "г": "u",
+    "ш": "i",
+    "щ": "o",
+    "з": "p",
+    "ф": "a",
+    "ы": "s",
+    "в": "d",
+    "а": "f",
+    "п": "g",
+    "р": "h",
+    "о": "j",
+    "л": "k",
+    "д": "l",
+    "я": "z",
+    "ч": "x",
+    "с": "c",
+    "м": "v",
+    "и": "b",
+    "т": "n",
+    "ь": "m",
+    # punctuation on RU layout (same physical keys as EN)
+    ".": "/",
+    ",": "/",
 }
 
 
@@ -1318,48 +1557,49 @@ class SortableFocusedTableMixin:
 # Expanded (fullscreen) table modal
 # ─────────────────────────────────────────────
 
+
 class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
     """Full-screen view of a single table. Esc to close. L to toggle live."""
 
     BINDINGS = [
-        Binding("escape,q,f", "dismiss",     "Close", show=True),
-        Binding("l",          "toggle_live",  "Live", show=True),
-        Binding("k",          "link",         "Link cols", show=True),
-        Binding("s",          "sort_column",  "Sort", show=True),
+        Binding("escape,q,f", "dismiss", "Close", show=True),
+        Binding("l", "toggle_live", "Live", show=True),
+        Binding("k", "link", "Link cols", show=True),
+        Binding("s", "sort_column", "Sort", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
 
     def __init__(
         self,
-        title:  str,
-        cols:   list[str],
-        rows:   list[tuple],
+        title: str,
+        cols: list[str],
+        rows: list[tuple],
         *,
-        conn:    sqlite3.Connection | None = None,
-        schema:  "Schema | None" = None,
+        conn: sqlite3.Connection | None = None,
+        schema: "Schema | None" = None,
         tbl_name: str | None = None,
-        pk_cols:  set[str] | None = None,
-        fk_cols:  "dict[str, FKInfo] | None" = None,
+        pk_cols: set[str] | None = None,
+        fk_cols: "dict[str, FKInfo] | None" = None,
         # context of the seed row that produced this table (for filtered live polling)
         seed_table: str | None = None,
         seed_pk_col: str | None = None,
         seed_pk_val: Any = None,
     ) -> None:
         super().__init__()
-        self._title    = title
-        self._cols     = cols
-        self._rows     = list(rows)
-        self._conn     = conn
-        self._schema   = schema
+        self._title = title
+        self._cols = cols
+        self._rows = list(rows)
+        self._conn = conn
+        self._schema = schema
         self._tbl_name = tbl_name
-        self._pk_cols: set[str]          = pk_cols or set()
+        self._pk_cols: set[str] = pk_cols or set()
         self._fk_cols: dict[str, FKInfo] = fk_cols or {}
         self._timer: Timer | None = None
         # seed context – used by _poll to fetch only related rows
-        self._seed_table   = seed_table
-        self._seed_pk_col  = seed_pk_col
-        self._seed_pk_val  = seed_pk_val
+        self._seed_table = seed_table
+        self._seed_pk_col = seed_pk_col
+        self._seed_pk_val = seed_pk_val
         # set of rows already shown (for diff highlighting)
         self._known_rows: set[tuple] = set(rows)
         self._flasher = RowFlasher()
@@ -1372,16 +1612,32 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
             f"[bold cyan]{self._title}[/]  [dim]{len(self._rows)} rows - Esc / F to close[/dim]",
             id="expanded-title",
         )
-        
-        self._rows = sql_sort_rows(self._conn, self._tbl_name, self._cols, self._rows, self._schema.sort_prefs.get(self._tbl_name) if self._schema else None)
-        
+
+        self._rows = sql_sort_rows(
+            self._conn,
+            self._tbl_name,
+            self._cols,
+            self._rows,
+            self._schema.sort_prefs.get(self._tbl_name) if self._schema else None,
+        )
+
         dt = DataTable(
             id="expanded-dt",
             zebra_stripes=True,
             cursor_type="cell",
         )
-        sort_info = self._schema.sort_prefs.get(self._tbl_name) if self._schema else None
-        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self._cols]
+        sort_info = (
+            self._schema.sort_prefs.get(self._tbl_name) if self._schema else None
+        )
+        filter_info = (
+            self._schema.filter_prefs.get(self._tbl_name)
+            if self._schema and self._tbl_name
+            else None
+        )
+        headers = [
+            _col_header(c, self._pk_cols, self._fk_cols, sort_info, filter_info)
+            for c in self._cols
+        ]
         dt.add_columns(*headers)
         for row in self._rows:
             dt.add_row(*_row_strs(row), key=str(row))
@@ -1409,13 +1665,24 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
         self._redraw_dt()
 
     def _redraw_dt(self) -> None:
-        if not self._schema or not self._tbl_name: return
+        if not self._schema or not self._tbl_name:
+            return
         dt = self.query_one("#expanded-dt", DataTable)
         cur_r, cur_c = dt.cursor_row, dt.cursor_column
-        self._rows = sql_sort_rows(self._conn, self._tbl_name, self._cols, self._rows, self._schema.sort_prefs.get(self._tbl_name))
+        self._rows = sql_sort_rows(
+            self._conn,
+            self._tbl_name,
+            self._cols,
+            self._rows,
+            self._schema.sort_prefs.get(self._tbl_name),
+        )
         dt.clear(columns=True)
         sort_info = self._schema.sort_prefs.get(self._tbl_name)
-        headers = [_col_header(c, self._pk_cols, self._fk_cols, sort_info) for c in self._cols]
+        filter_info = self._schema.filter_prefs.get(self._tbl_name)
+        headers = [
+            _col_header(c, self._pk_cols, self._fk_cols, sort_info, filter_info)
+            for c in self._cols
+        ]
         dt.add_columns(*headers)
         for row in self._rows:
             key = str(row)
@@ -1465,16 +1732,25 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
             # (e.g. the screen was opened directly, not from ObservationScreen).
             if self._seed_table and self._seed_pk_col and self._seed_pk_val is not None:
                 new_obs = build_observation(
-                    self._conn, self._schema,
-                    self._seed_table, self._seed_pk_col, self._seed_pk_val,
+                    self._conn,
+                    self._schema,
+                    self._seed_table,
+                    self._seed_pk_col,
+                    self._seed_pk_val,
                 )
                 if self._tbl_name == self._seed_table:
                     related_rows = [new_obs.seed_row] if new_obs.seed_row else []
                 else:
-                    related_rows = new_obs.related.get(self._tbl_name, (self._cols, []))[1]
+                    related_rows = new_obs.related.get(
+                        self._tbl_name, (self._cols, [])
+                    )[1]
                 all_rows = related_rows
             else:
-                sort_info = self._schema.sort_prefs.get(self._tbl_name) if self._schema else None
+                sort_info = (
+                    self._schema.sort_prefs.get(self._tbl_name)
+                    if self._schema
+                    else None
+                )
                 _, all_rows = fetch_all_rows(self._conn, self._tbl_name, sort_info)
         except Exception:
             return
@@ -1497,7 +1773,8 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
         new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
         self._update_live_label(
             f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
-            if self.live else ""
+            if self.live
+            else ""
         )
 
     def _refresh_title(self) -> None:
@@ -1525,15 +1802,18 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
         if row_index >= len(self._rows):
             return
 
-        raw_row  = self._rows[row_index]
+        raw_row = self._rows[row_index]
         row_dict = dict(zip(self._cols, raw_row))
-        pk_col   = get_pk_column(self._conn, self._tbl_name) or self._cols[0]
-        pk_val   = row_dict.get(pk_col, raw_row[0])
+        pk_col = get_pk_column(self._conn, self._tbl_name) or self._cols[0]
+        pk_val = row_dict.get(pk_col, raw_row[0])
 
         self.app.push_screen(
             ObservationScreen(
-                self._conn, self._schema,
-                self._tbl_name, pk_col, pk_val,
+                self._conn,
+                self._schema,
+                self._tbl_name,
+                pk_col,
+                pk_val,
             )
         )
 
@@ -1550,7 +1830,8 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
         from_col = self._cols[col_index]
 
         existing = [
-            fk for fk in self._schema.fk_from.get(self._tbl_name, [])
+            fk
+            for fk in self._schema.fk_from.get(self._tbl_name, [])
             if fk.virtual and fk.from_col == from_col
         ]
 
@@ -1569,10 +1850,15 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
                 on_change,
             )
         else:
+
             def on_builder_result(saved: bool) -> None:
                 if saved:
                     VirtualLinks.inject(self._schema)
-                    self.notify(f"{self._tbl_name}.{from_col} linked", title="Virtual link created")
+                    self.notify(
+                        f"{self._tbl_name}.{from_col} linked",
+                        title="Virtual link created",
+                    )
+
             self.app.push_screen(
                 LinkBuilderScreen(
                     db_path=self._schema.db_path,
@@ -1588,35 +1874,36 @@ class ExpandedTableScreen(SortableSingleTableMixin, RuKeysMixin, ModalScreen):
 # Screens
 # ─────────────────────────────────────────────
 
+
 class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
     """Shows the observation. Press L to toggle live polling."""
 
     BINDINGS = [
         Binding("escape,q", "app.pop_screen", "Back", show=True),
-        Binding("l",        "toggle_live",    "Live",   show=True),
-        Binding("f",        "expand_focused", "Expand", show=True),
-        Binding("k",        "link",           "Link cols", show=True),
-        Binding("s",        "sort_column",    "Sort", show=True),
+        Binding("l", "toggle_live", "Live", show=True),
+        Binding("f", "expand_focused", "Expand", show=True),
+        Binding("k", "link", "Link cols", show=True),
+        Binding("s", "sort_column", "Sort", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
 
     def __init__(
         self,
-        conn:    sqlite3.Connection,
-        schema:  Schema,
-        table:   str,
-        pk_col:  str,
-        pk_val:  Any,
+        conn: sqlite3.Connection,
+        schema: Schema,
+        table: str,
+        pk_col: str,
+        pk_val: Any,
     ) -> None:
         super().__init__()
-        self._conn   = conn
+        self._conn = conn
         self._schema = schema
-        self._table  = table
+        self._table = table
         self._pk_col = pk_col
         self._pk_val = pk_val
 
-        self._obs    = build_observation(conn, schema, table, pk_col, pk_val)
+        self._obs = build_observation(conn, schema, table, pk_col, pk_val)
         self._timer: Timer | None = None
         # block_id → TableBlock
         self._blocks: dict[str, TableBlock] = {}
@@ -1713,7 +2000,8 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
         from_col = block.cols[col_index]
 
         existing = [
-            fk for fk in self._schema.fk_from.get(block.tbl_name, [])
+            fk
+            for fk in self._schema.fk_from.get(block.tbl_name, [])
             if fk.virtual and fk.from_col == from_col
         ]
 
@@ -1721,8 +2009,11 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
             if changed:
                 VirtualLinks.inject(self._schema)
                 self._obs = build_observation(
-                    self._conn, self._schema,
-                    self._table, self._pk_col, self._pk_val,
+                    self._conn,
+                    self._schema,
+                    self._table,
+                    self._pk_col,
+                    self._pk_val,
                 )
                 self._rebuild_blocks()
 
@@ -1737,10 +2028,15 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
                 on_result,
             )
         else:
+
             def on_builder_result(saved: bool) -> None:
                 if saved:
                     on_result(True)
-                    self.notify(f"{block.tbl_name}.{from_col} linked", title="Virtual link created")
+                    self.notify(
+                        f"{block.tbl_name}.{from_col} linked",
+                        title="Virtual link created",
+                    )
+
             self.app.push_screen(
                 LinkBuilderScreen(
                     db_path=db_path,
@@ -1772,7 +2068,11 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
             seed_blk.update_rows([obs.seed_row] if obs.seed_row else [])
 
         # remove blocks for tables no longer in observation
-        gone = [tbl for tbl in list(self._blocks) if tbl != "seed" and tbl not in obs.related]
+        gone = [
+            tbl
+            for tbl in list(self._blocks)
+            if tbl != "seed" and tbl not in obs.related
+        ]
         for tbl in gone:
             blk = self._blocks.pop(tbl)
             blk.remove()
@@ -1781,18 +2081,28 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
         for tbl_name, (cols, rows) in obs.related.items():
             if tbl_name in self._blocks:
                 self._blocks[tbl_name].refresh_col_meta(self._conn)
-                self._blocks[tbl_name].set_relation_kind(obs.related_kind.get(tbl_name, ""))
-                self._blocks[tbl_name].set_relation_via(obs.related_via.get(tbl_name, set()))
+                self._blocks[tbl_name].set_relation_kind(
+                    obs.related_kind.get(tbl_name, "")
+                )
+                self._blocks[tbl_name].set_relation_via(
+                    obs.related_via.get(tbl_name, set())
+                )
                 self._blocks[tbl_name].update_rows(rows)
             else:
                 _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
                 blk = TableBlock(
-                    table=tbl_name, cols=cols, rows=rows,
-                    is_seed=False, pk_cols=_pk, fk_cols=_fk, schema=self._schema,
+                    table=tbl_name,
+                    cols=cols,
+                    rows=rows,
+                    is_seed=False,
+                    pk_cols=_pk,
+                    fk_cols=_fk,
+                    schema=self._schema,
                     conn=self._conn,
                     relation_kind=obs.related_kind.get(tbl_name, ""),
                     relation_via=obs.related_via.get(tbl_name, set()),
-                    id=f"block-{tbl_name}", classes="obs-block",
+                    id=f"block-{tbl_name}",
+                    classes="obs-block",
                 )
                 self._blocks[tbl_name] = blk
                 scroll.mount(blk)
@@ -1834,8 +2144,11 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
     def _reload(self) -> None:
         """Fetch fresh observation after sort changes, completely redraw all blocks."""
         self._obs = build_observation(
-            self._conn, self._schema,
-            self._table, self._pk_col, self._pk_val,
+            self._conn,
+            self._schema,
+            self._table,
+            self._pk_col,
+            self._pk_val,
         )
         for bid, blk in self._blocks.items():
             real_tbl = blk.tbl_name
@@ -1861,15 +2174,18 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
         if row_index >= len(block.all_rows):
             return
 
-        raw_row  = block.all_rows[row_index]
+        raw_row = block.all_rows[row_index]
         row_dict = dict(zip(block.cols, raw_row))
-        pk_col   = get_pk_column(self._conn, block.tbl_name) or block.cols[0]
-        pk_val   = row_dict.get(pk_col, raw_row[0])
+        pk_col = get_pk_column(self._conn, block.tbl_name) or block.cols[0]
+        pk_val = row_dict.get(pk_col, raw_row[0])
 
         self.app.push_screen(
             ObservationScreen(
-                self._conn, self._schema,
-                block.tbl_name, pk_col, pk_val,
+                self._conn,
+                self._schema,
+                block.tbl_name,
+                pk_col,
+                pk_val,
             )
         )
 
@@ -1879,8 +2195,7 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
         """Open the currently-focused DataTable in full-screen modal."""
         focused = self.focused
         target_block = (
-            self._block_for_widget(focused)
-            if isinstance(focused, DataTable) else None
+            self._block_for_widget(focused) if isinstance(focused, DataTable) else None
         )
 
         # fallback: first block
@@ -1914,8 +2229,11 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
         """Fetch fresh observation, compute diff, update UI."""
         try:
             new_obs = build_observation(
-                self._conn, self._schema,
-                self._table, self._pk_col, self._pk_val,
+                self._conn,
+                self._schema,
+                self._table,
+                self._pk_col,
+                self._pk_val,
             )
         except Exception:
             return
@@ -1973,7 +2291,11 @@ class ObservationScreen(SortableFocusedTableMixin, RuKeysMixin, Screen):
             new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
             try:
                 lbl = self.query_one("#live-status", Label)
-                update_live_label(lbl, self.live, f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]")
+                update_live_label(
+                    lbl,
+                    self.live,
+                    f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]",
+                )
             except Exception:
                 pass
 
@@ -1983,21 +2305,26 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
 
     BINDINGS = [
         Binding("escape,q", "app.pop_screen", "Back", show=True),
-        Binding("r",        "refresh",        "Refresh", show=True),
-        Binding("l",        "toggle_live",    "Live", show=True),
-        Binding("k",        "link",           "Link cols", show=True),
-        Binding("s",        "sort_column",    "Sort", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
+        Binding("l", "toggle_live", "Live", show=True),
+        Binding("k", "link", "Link cols", show=True),
+        Binding("/", "filter_column", "Filter", show=True),
+        Binding("s", "sort_column", "Sort", show=True),
     ]
 
     live: reactive[bool] = reactive(False)
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, table: str) -> None:
         super().__init__()
-        self.conn   = conn
+        self.conn = conn
         self.schema = schema
-        self.table  = table
+        self.table = table
         self.pk_col = get_pk_column(conn, table)
-        self.cols, self.rows = fetch_all_rows(conn, table)
+        self.cols, self.rows = fetch_all_rows(
+            conn,
+            table,
+            filter_info=schema.filter_prefs.get(table),
+        )
         self._known_rows: set[tuple] = set(self.rows)
         self._flasher = RowFlasher()
         self._timer: Timer | None = None
@@ -2026,7 +2353,8 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
 
     def _live_poll(self) -> None:
         sort_info = self.schema.sort_prefs.get(self.table)
-        _, all_rows = fetch_all_rows(self.conn, self.table, sort_info)
+        filter_info = self.schema.filter_prefs.get(self.table)
+        _, all_rows = fetch_all_rows(self.conn, self.table, sort_info, filter_info)
         new_rows = [r for r in all_rows if r not in self._known_rows]
 
         if new_rows:
@@ -2035,7 +2363,7 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
                 self._flasher.add(str(row))
             self.rows = all_rows
             self._redraw_dt()
-            self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
+            self.app.sub_title = f"{self.table}  ({len(self.rows)} rows){_filter_caption(filter_info)} - Enter to observe"
 
         # tick flash
         self._flasher.tick(self.query_one("#row-table", DataTable))
@@ -2043,27 +2371,62 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
         ts = datetime.now().strftime("%H:%M:%S")
         n_new = len(new_rows)
         new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
-        self._update_live_label(f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]")
+        self._update_live_label(
+            f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
+        )
 
     # ── reload (manual refresh) ───────────────
 
     def _reload(self) -> None:
         sort_info = self.schema.sort_prefs.get(self.table)
-        self.cols, self.rows = fetch_all_rows(self.conn, self.table, sort_info)
+        filter_info = self.schema.filter_prefs.get(self.table)
+        self.cols, self.rows = fetch_all_rows(
+            self.conn, self.table, sort_info, filter_info
+        )
         self._known_rows = set(self.rows)
         self._flasher.clear()
         self._redraw_dt()
-        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
+        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows){_filter_caption(filter_info)} - Enter to observe"
 
     def action_refresh(self) -> None:
         self._reload()
         self.query_one("#row-table", DataTable).focus()
 
+    def action_filter_column(self) -> None:
+        dt = self.query_one("#row-table", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self.cols):
+            return
+        col_name = self.cols[col_index]
+        current = None
+        active = self.schema.filter_prefs.get(self.table)
+        if active and active[0] == col_name:
+            current = active[1]
+
+        def on_value(raw: str | None) -> None:
+            if raw is None:
+                return
+            value_text = raw.strip()
+            if value_text == "":
+                clear_and_save_filter(self.schema, self.table)
+                self.notify(f"Filter cleared: {self.table}", title="Filter")
+            else:
+                value = _parse_filter_value(value_text)
+                set_and_save_filter(self.schema, self.table, col_name, value)
+                self.notify(
+                    f"Filter set: {self.table}.{col_name} = {_fmt(value)}",
+                    title="Filter",
+                )
+            self._reload()
+            self.query_one("#row-table", DataTable).focus()
+
+        self.app.push_screen(FilterValueScreen(self.table, col_name, current), on_value)
+
     def _sync_live_from_app(self) -> None:
         self.live = _app_live_get(self.app, self.table)
 
     def on_mount(self) -> None:
-        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows) - Enter to observe"
+        self.app.sub_title = f"{self.table}  ({len(self.rows)} rows){_filter_caption(self.schema.filter_prefs.get(self.table))} - Enter to observe"
         self._sync_live_from_app()
         self.query_one("#row-table", DataTable).focus()
 
@@ -2081,10 +2444,19 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
         yield Label("", id="live-status")
         pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
         dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="cell")
-        
-        self.rows = sql_sort_rows(self.conn, self.table, self.cols, self.rows, self.schema.sort_prefs.get(self.table))
+
+        self.rows = sql_sort_rows(
+            self.conn,
+            self.table,
+            self.cols,
+            self.rows,
+            self.schema.sort_prefs.get(self.table),
+        )
         sort_info = self.schema.sort_prefs.get(self.table)
-        headers = [_col_header(c, pk_cols, fk_cols, sort_info) for c in self.cols]
+        filter_info = self.schema.filter_prefs.get(self.table)
+        headers = [
+            _col_header(c, pk_cols, fk_cols, sort_info, filter_info) for c in self.cols
+        ]
         dt.add_columns(*headers)
         for row in self.rows:
             dt.add_row(*_row_strs(row), key=str(row))
@@ -2115,7 +2487,10 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
         dt.clear(columns=True)
         pk_cols, fk_cols = _build_col_meta(self.conn, self.schema, self.table)
         sort_info = self.schema.sort_prefs.get(self.table)
-        headers = [_col_header(c, pk_cols, fk_cols, sort_info) for c in self.cols]
+        filter_info = self.schema.filter_prefs.get(self.table)
+        headers = [
+            _col_header(c, pk_cols, fk_cols, sort_info, filter_info) for c in self.cols
+        ]
         dt.add_columns(*headers)
         for row in self.rows:
             key = str(row)
@@ -2129,10 +2504,10 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
         row_index = event.coordinate.row
         if row_index >= len(self.rows):
             return
-        raw_row  = self.rows[row_index]
+        raw_row = self.rows[row_index]
         row_dict = dict(zip(self.cols, raw_row))
-        pk_col   = self.pk_col or self.cols[0]
-        pk_val   = row_dict.get(pk_col, raw_row[0])
+        pk_col = self.pk_col or self.cols[0]
+        pk_val = row_dict.get(pk_col, raw_row[0])
 
         screen = ObservationScreen(self.conn, self.schema, self.table, pk_col, pk_val)
         self.app.push_screen(screen)
@@ -2150,7 +2525,8 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
         from_col = self.cols[col_index]
 
         existing = [
-            fk for fk in self.schema.fk_from.get(self.table, [])
+            fk
+            for fk in self.schema.fk_from.get(self.table, [])
             if fk.virtual and fk.from_col == from_col
         ]
 
@@ -2170,11 +2546,15 @@ class RowPickerScreen(SortableSingleTableMixin, RuKeysMixin, Screen):
                 on_change,
             )
         else:
+
             def on_builder_result(saved: bool) -> None:
                 if saved:
                     VirtualLinks.inject(self.schema)
-                    self.notify(f"{self.table}.{from_col} linked", title="Virtual link created")
+                    self.notify(
+                        f"{self.table}.{from_col} linked", title="Virtual link created"
+                    )
                     self._reload()
+
             self.app.push_screen(
                 LinkBuilderScreen(
                     db_path=self.schema.db_path,
@@ -2193,8 +2573,8 @@ class TablePickerScreen(RuKeysMixin, Screen):
 
     def __init__(self, conn: sqlite3.Connection, schema: Schema, db_path: str) -> None:
         super().__init__()
-        self.conn    = conn
-        self.schema  = schema
+        self.conn = conn
+        self.schema = schema
         self.db_path = db_path
 
     def compose(self) -> ComposeResult:
@@ -2210,9 +2590,7 @@ class TablePickerScreen(RuKeysMixin, Screen):
 
     @on(ListView.Selected, "#table-list")
     def table_selected(self, event: ListView.Selected) -> None:
-        self.app.push_screen(
-            RowPickerScreen(self.conn, self.schema, event.item.name)
-        )
+        self.app.push_screen(RowPickerScreen(self.conn, self.schema, event.item.name))
 
 
 class OpenDBScreen(Screen):
@@ -2380,7 +2758,7 @@ LinkManagerScreen #mgr-hint {
 
 class DbObserverApp(App):
     TITLE = "DbObserver"
-    CSS   = CSS
+    CSS = CSS
     BINDINGS = [Binding("ctrl+q", "quit", "Quit", show=True)]
 
     def __init__(self, db_path: str | None = None) -> None:
