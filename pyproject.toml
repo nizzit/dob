@@ -2,14 +2,10 @@
 name = "dob"
 version = "0.1.0"
 description = "SQL DB graph explorer — observe a record and all its related data"
+requires-python = ">=3.13"
 dependencies = [
     "textual>=8.2.5",
 ]
 
-
 [project.scripts]
-dob = "dob:main"
-requires-python = ">=3.13"
-dependencies = [
-    "textual>=8.2.4",
-]
+dob = "dob.cli:main"

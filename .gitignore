@@ -21,3 +21,7 @@ lightrag.*
 
 # Config
 *.dob.json
+
+# Misc / stray dirs
+list/
+inputs/
