@@ -1,0 +1,264 @@
+"""
+dob.ui.screens.row_picker
+~~~~~~~~~~~~~~~~~~~~~~~~~
+RowPickerScreen — pick a row from a table to observe.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime
+from typing import Any
+
+from textual import on
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, Label
+
+from dob.db.lookup import LookupCache
+from dob.db.queries import fetch_all_rows, get_pk_column, sql_sort_rows
+from dob.db.schema import Schema
+from dob.settings.filters import parse_filter_value
+from dob.settings.links import VirtualLinks
+from dob.settings.preferences import UserPreferences
+from dob.ui.drilldown import open_observation_for_row
+from dob.ui.flasher import RowFlasher, _mark_row
+from dob.ui.formatting import filter_caption, HeaderBuilder, fmt
+from dob.ui.link_actions import open_link_menu
+from dob.ui.live_poller import LIVE_INTERVAL, update_live_label
+from dob.ui.screens.filter_value import FilterValueScreen
+from dob.ui.sort_mixin import SortableMixin
+from dob.ui.widgets.table_block import _build_col_meta
+
+
+class RowPickerScreen(SortableMixin, Screen):
+    """Pick a row from a table.  L - live mode, R - manual refresh, / - filter."""
+
+    BINDINGS = [
+        Binding("escape,q", "app.pop_screen", "Back", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
+        Binding("l", "toggle_live", "Live", show=True),
+        Binding("k", "link", "Link cols", show=True),
+        Binding("/", "filter_column", "Filter", show=True),
+        Binding("s", "sort_column", "Sort", show=True),
+    ]
+
+    def __init__(self, conn: sqlite3.Connection, schema: Schema, prefs: UserPreferences, table: str) -> None:
+        super().__init__()
+        self._conn = conn
+        self._schema = schema
+        self._prefs = prefs
+        self.table = table
+        self._lookup = LookupCache(conn)
+        self.pk_col = get_pk_column(conn, table)
+        self.cols, self.rows = fetch_all_rows(
+            conn, table, filter_info=prefs.get_filter(table)
+        )
+        self._known_rows: set[tuple] = set(self.rows)
+        self._flasher = RowFlasher()
+        self._timer = None
+        self._is_live = False
+
+    # ── SortableMixin interface ───────────────────────────────────────────────
+
+    @property
+    def _sort_prefs(self) -> UserPreferences:
+        return self._prefs
+
+    def _resolve_sort_target(self, widget: Any = None) -> tuple[str, list[str]] | None:
+        return self.table, self.cols
+
+    def _after_sort(self) -> None:
+        self._reload()
+
+    # ── compose ───────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield Label("", id="live-status")
+        pk_cols, fk_cols = _build_col_meta(self._conn, self._schema, self.table)
+        dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="cell")
+        self.rows = sql_sort_rows(
+            self._conn, self.table, self.cols, self.rows,
+            self._prefs.get_sort(self.table),
+        )
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+        headers = HeaderBuilder(pk_cols, fk_cols, sort_info, filter_info).headers(self.cols)
+        dt.add_columns(*headers)
+        for row in self.rows:
+            dt.add_row(*[fmt(v) for v in row], key=str(row))
+        yield dt
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        fi = self._prefs.get_filter(self.table)
+        self.app.sub_title = (
+            f"{self.table}  ({len(self.rows)} rows){filter_caption(fi)} - Enter to observe"
+        )
+        live = getattr(self.app, "is_table_live", lambda t: False)(self.table)
+        if live:
+            self._start_live()
+        self.query_one("#row-table", DataTable).focus()
+
+    def on_screen_resume(self) -> None:
+        live = getattr(self.app, "is_table_live", lambda t: False)(self.table)
+        if live and not self._is_live:
+            self._start_live()
+        elif not live and self._is_live:
+            self._stop_live()
+
+    def on_unmount(self) -> None:
+        self.app.sub_title = ""
+        if self._timer:
+            self._timer.stop()
+
+    # ── live ─────────────────────────────────────────────────────────────────
+
+    def action_toggle_live(self) -> None:
+        if self._is_live:
+            self._stop_live()
+        else:
+            self._start_live()
+        setter = getattr(self.app, "set_table_live", None)
+        if callable(setter):
+            setter(self.table, self._is_live)
+
+    def _start_live(self) -> None:
+        self._is_live = True
+        self._timer = self.set_interval(LIVE_INTERVAL, self._live_poll)
+        self._update_live_label()
+
+    def _stop_live(self) -> None:
+        self._is_live = False
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
+        self._update_live_label()
+
+    def _update_live_label(self, extra: str = "") -> None:
+        try:
+            lbl = self.query_one("#live-status", Label)
+            update_live_label(lbl, self._is_live, extra)
+        except Exception:
+            pass
+
+    def _live_poll(self) -> None:
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+        _, all_rows = fetch_all_rows(self._conn, self.table, sort_info, filter_info)
+        new_rows = [r for r in all_rows if r not in self._known_rows]
+        if new_rows:
+            for row in new_rows:
+                self._known_rows.add(row)
+                self._flasher.add(str(row))
+            self.rows = all_rows
+            self._redraw_dt()
+            fi = self._prefs.get_filter(self.table)
+            self.app.sub_title = (
+                f"{self.table}  ({len(self.rows)} rows){filter_caption(fi)} - Enter to observe"
+            )
+        self._flasher.tick(self.query_one("#row-table", DataTable))
+        ts = datetime.now().strftime("%H:%M:%S")
+        n_new = len(new_rows)
+        new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
+        self._update_live_label(f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]")
+
+    # ── reload / refresh ─────────────────────────────────────────────────────
+
+    def _reload(self) -> None:
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+        self.cols, self.rows = fetch_all_rows(self._conn, self.table, sort_info, filter_info)
+        self._known_rows = set(self.rows)
+        self._flasher.clear()
+        self._redraw_dt()
+        fi = self._prefs.get_filter(self.table)
+        self.app.sub_title = (
+            f"{self.table}  ({len(self.rows)} rows){filter_caption(fi)} - Enter to observe"
+        )
+
+    def action_refresh(self) -> None:
+        self._reload()
+        self.query_one("#row-table", DataTable).focus()
+
+    def action_filter_column(self) -> None:
+        dt = self.query_one("#row-table", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self.cols):
+            return
+        col_name = self.cols[col_index]
+        active = self._prefs.get_filter(self.table)
+        current = active[1] if active and active[0] == col_name else None
+
+        def on_value(raw: str | None) -> None:
+            if raw is None:
+                return
+            text = raw.strip()
+            if text == "":
+                self._prefs.clear_filter(self.table)
+                self.notify(f"Filter cleared: {self.table}", title="Filter")
+            else:
+                value = parse_filter_value(text)
+                self._prefs.set_filter(self.table, col_name, value)
+                self.notify(
+                    f"Filter set: {self.table}.{col_name} = {fmt(value)}", title="Filter"
+                )
+            self._reload()
+            self.query_one("#row-table", DataTable).focus()
+
+        self.app.push_screen(FilterValueScreen(self.table, col_name, current), on_value)
+
+    # ── events ────────────────────────────────────────────────────────────────
+
+    @on(DataTable.HeaderSelected, "#row-table")
+    def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        if event.column_index < len(self.cols):
+            self._toggle_sort(self.table, self.cols[event.column_index])
+
+    @on(DataTable.CellSelected, "#row-table")
+    def row_selected(self, event: DataTable.CellSelected) -> None:
+        row_index = event.coordinate.row
+        if row_index >= len(self.rows):
+            return
+        open_observation_for_row(
+            self.app, self._conn, self._schema, self._prefs,
+            self.table, self.cols, self.rows[row_index],
+        )
+
+    def action_link(self) -> None:
+        db_path = getattr(self._schema, "db_path", "")
+        if not db_path:
+            return
+        dt = self.query_one("#row-table", DataTable)
+        col_index = dt.cursor_column
+        if col_index >= len(self.cols):
+            return
+        from_col = self.cols[col_index]
+
+        def on_changed() -> None:
+            VirtualLinks.inject(self._schema, db_path)
+            self._reload()
+
+        open_link_menu(self, self._schema, db_path, self.table, from_col, on_changed)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _redraw_dt(self) -> None:
+        dt = self.query_one("#row-table", DataTable)
+        cur_r, cur_c = dt.cursor_row, dt.cursor_column
+        dt.clear(columns=True)
+        pk_cols, fk_cols = _build_col_meta(self._conn, self._schema, self.table)
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+        headers = HeaderBuilder(pk_cols, fk_cols, sort_info, filter_info).headers(self.cols)
+        dt.add_columns(*headers)
+        for row in self.rows:
+            key = str(row)
+            dt.add_row(*[fmt(v) for v in row], key=key)
+            if self._flasher.has(key):
+                _mark_row(dt, key, new=True)
+        dt.move_cursor(row=min(cur_r, max(0, len(self.rows) - 1)), column=cur_c)

@@ -29,6 +29,10 @@ class Schema:
     fk_from: dict[str, list[FKInfo]] = field(default_factory=dict)
     fk_to: dict[str, list[FKInfo]] = field(default_factory=dict)
     col_cache: dict[str, list[str]] = field(default_factory=dict)  # table→cols
+    # db_path is set by the application layer after loading so that
+    # VirtualLinks can locate the settings file without passing it separately.
+    # It is intentionally NOT used in domain/traversal logic.
+    db_path: str = ""
 
 
 def load_schema(conn: sqlite3.Connection) -> Schema:
