@@ -1,5 +1,5 @@
 """
-DbObserver - minimal SQLite relationship explorer.
+dob - minimal SQLite relationship explorer.
 
 Flow:
   1. Open a .db file (passed as CLI arg or entered in the app)
@@ -267,7 +267,7 @@ def fetch_related_rows_in(
 
 class ProjectSettings:
     """
-    Persists user-defined settings in <db>.dbobserver.json.
+    Persists user-defined settings in <db>.dob.json.
     Format: {
         "links": [ {from_table, from_col, to_table, to_col}, ... ],
         "sorts": { "table_name": ["col_name", reverse_bool], ... },
@@ -277,7 +277,7 @@ class ProjectSettings:
 
     @staticmethod
     def _path(db_path: str) -> Path:
-        return Path(db_path).with_suffix(".dbobserver.json")
+        return Path(db_path).with_suffix(".dob.json")
 
     @classmethod
     def load(cls, db_path: str) -> dict:
@@ -2603,7 +2603,7 @@ class OpenDBScreen(Screen):
         yield Footer()
         with Vertical(id="open-db-container"):
             yield Static(
-                "[bold cyan]DbObserver[/]\n[dim]SQLite relationship explorer[/dim]",
+                "[bold cyan]dob[/]\n[dim]SQLite relationship explorer[/dim]",
                 id="logo",
             )
             yield Label("Path to SQLite database file:")
@@ -2756,8 +2756,8 @@ LinkManagerScreen #mgr-hint {
 """
 
 
-class DbObserverApp(App):
-    TITLE = "DbObserver"
+class DobApp(App):
+    TITLE = "dob"
     CSS = CSS
     BINDINGS = [Binding("ctrl+q", "quit", "Quit", show=True)]
 
@@ -2787,7 +2787,7 @@ class DbObserverApp(App):
 
 def main() -> None:
     db_path = sys.argv[1] if len(sys.argv) > 1 else None
-    DbObserverApp(db_path=db_path).run()
+    DobApp(db_path=db_path).run()
 
 
 if __name__ == "__main__":

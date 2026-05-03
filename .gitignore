@@ -20,4 +20,4 @@ rag_storage/
 lightrag.*
 
 # Config
-*.dbobserver.json
+*.dob.json

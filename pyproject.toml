@@ -1,11 +1,14 @@
 [project]
-name = "dbobserver"
+name = "dob"
 version = "0.1.0"
 description = "SQL DB graph explorer — observe a record and all its related data"
+dependencies = [
+    "textual>=8.2.5",
+]
 
 
 [project.scripts]
-dbobserver = "dbobserver:main"
+dob = "dob:main"
 requires-python = ">=3.13"
 dependencies = [
     "textual>=8.2.4",
