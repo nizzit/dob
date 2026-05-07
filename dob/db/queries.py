@@ -89,6 +89,8 @@ def fetch_all_rows(
     table: str,
     sort_info: tuple[str, bool] | None = None,
     filter_info: tuple[str, Any] | None = None,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> tuple[list[str], list[tuple]]:
     cur = conn.cursor()
     ph = _placeholder(conn)
@@ -103,11 +105,38 @@ def fetch_all_rows(
         else:
             where_sql = f' WHERE {qc} = {ph}'
             params.append(val)
+    limit_sql = ""
+    if limit is not None:
+        limit_sql = f' LIMIT {int(limit)} OFFSET {int(offset)}'
     cur.execute(
-        f'SELECT * FROM {qt}{where_sql}{order_clause(sort_info, conn)}', params
+        f'SELECT * FROM {qt}{where_sql}{order_clause(sort_info, conn)}{limit_sql}', params
     )
     cols = [d[0] for d in cur.description]
-    return cols, cur.fetchall()
+    return cols, list(cur.fetchall())
+
+
+def count_rows(
+    conn: Any,
+    table: str,
+    filter_info: tuple[str, Any] | None = None,
+) -> int:
+    """Return total row count (with optional filter) without fetching data."""
+    cur = conn.cursor()
+    ph = _placeholder(conn)
+    qt = _q(conn, table)
+    where_sql = ""
+    params: list[Any] = []
+    if filter_info:
+        col, val = filter_info
+        qc = _q(conn, col)
+        if val is None:
+            where_sql = f' WHERE {qc} IS NULL'
+        else:
+            where_sql = f' WHERE {qc} = {ph}'
+            params.append(val)
+    cur.execute(f'SELECT COUNT(*) FROM {qt}{where_sql}', params)
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 def fetch_row_by_pk(

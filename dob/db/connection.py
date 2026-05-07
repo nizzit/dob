@@ -100,5 +100,6 @@ def _open_mysql(dsn: str) -> MysqlBackend:
         database=database,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.Cursor,
+        autocommit=True,
     )
     return MysqlBackend(raw)

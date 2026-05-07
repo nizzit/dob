@@ -17,7 +17,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label
 
 from dob.db.lookup import LookupCache
-from dob.db.queries import fetch_all_rows, get_pk_column, sql_sort_rows
+from dob.db.queries import count_rows, fetch_all_rows, get_pk_column
 from dob.db.schema import Schema
 from dob.settings.filters import parse_filter_value
 from dob.settings.links import VirtualLinks
@@ -30,6 +30,11 @@ from dob.ui.live_poller import LIVE_INTERVAL, update_live_label
 from dob.ui.screens.filter_value import FilterValueScreen
 from dob.ui.sort_mixin import SortableMixin
 from dob.ui.widgets.table_block import _build_col_meta
+
+
+# How many rows to load per page (initial + each incremental load).
+# Sized to comfortably fill a typical terminal; more loaded on demand.
+_PAGE_SIZE = 200
 
 
 class RowPickerScreen(SortableMixin, Screen):
@@ -52,9 +57,18 @@ class RowPickerScreen(SortableMixin, Screen):
         self.table = table
         self._lookup = LookupCache(conn)
         self.pk_col = get_pk_column(conn, table)
+        # Pagination state
+        self._offset: int = 0
+        self._total: int = 0
+        self._all_loaded: bool = False
+        # Fetch first page
+        fi = prefs.get_filter(table)
+        self._total = count_rows(conn, table, fi)
         self.cols, self.rows = fetch_all_rows(
-            conn, table, filter_info=prefs.get_filter(table)
+            conn, table, filter_info=fi, limit=_PAGE_SIZE, offset=0
         )
+        self._offset = len(self.rows)
+        self._all_loaded = self._offset >= self._total
         self._known_rows: set[tuple] = set(self.rows)
         self._flasher = RowFlasher()
         self._timer = None
@@ -80,12 +94,17 @@ class RowPickerScreen(SortableMixin, Screen):
         yield Label("", id="live-status")
         pk_cols, fk_cols = _build_col_meta(self._conn, self._schema, self.table)
         dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="cell")
-        self.rows = sql_sort_rows(
-            self._conn, self.table, self.cols, self.rows,
-            self._prefs.get_sort(self.table),
-        )
         sort_info = self._prefs.get_sort(self.table)
         filter_info = self._prefs.get_filter(self.table)
+        # Re-fetch first page with sort applied via SQL (avoids in-memory sort)
+        if sort_info:
+            self.cols, self.rows = fetch_all_rows(
+                self._conn, self.table, sort_info, filter_info,
+                limit=_PAGE_SIZE, offset=0,
+            )
+            self._offset = len(self.rows)
+            self._all_loaded = self._offset >= self._total
+            self._known_rows = set(self.rows)  # sync with what's actually displayed
         headers = HeaderBuilder(pk_cols, fk_cols, sort_info, filter_info).headers(self.cols)
         dt.add_columns(*headers)
         for row in self.rows:
@@ -95,10 +114,7 @@ class RowPickerScreen(SortableMixin, Screen):
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        fi = self._prefs.get_filter(self.table)
-        self.app.sub_title = (
-            f"{self.table}  ({len(self.rows)} rows){filter_caption(fi)} - Enter to observe"
-        )
+        self._update_subtitle()
         live = getattr(self.app, "is_table_live", lambda t: False)(self.table)
         if live:
             self._start_live()
@@ -149,18 +165,23 @@ class RowPickerScreen(SortableMixin, Screen):
     def _live_poll(self) -> None:
         sort_info = self._prefs.get_sort(self.table)
         filter_info = self._prefs.get_filter(self.table)
+        # Fetch everything — live mode must see all rows, not just a page
         _, all_rows = fetch_all_rows(self._conn, self.table, sort_info, filter_info)
+        # Compare against the full known set (which may be only a first page).
+        # Anything not yet in _known_rows is either truly new or was beyond the
+        # loaded page — either way we add it to the table.
         new_rows = [r for r in all_rows if r not in self._known_rows]
         if new_rows:
             for row in new_rows:
                 self._known_rows.add(row)
                 self._flasher.add(str(row))
-            self.rows = all_rows
+            # Rebuild full row list: keep loaded order + append new at end
+            self.rows = list(all_rows)  # switch to full sorted list from DB
+            self._offset = len(all_rows)
+            self._total = len(all_rows)
+            self._all_loaded = True
             self._redraw_dt()
-            fi = self._prefs.get_filter(self.table)
-            self.app.sub_title = (
-                f"{self.table}  ({len(self.rows)} rows){filter_caption(fi)} - Enter to observe"
-            )
+            self._update_subtitle()
         self._flasher.tick(self.query_one("#row-table", DataTable))
         ts = datetime.now().strftime("%H:%M:%S")
         n_new = len(new_rows)
@@ -172,18 +193,33 @@ class RowPickerScreen(SortableMixin, Screen):
     def _reload(self) -> None:
         sort_info = self._prefs.get_sort(self.table)
         filter_info = self._prefs.get_filter(self.table)
-        self.cols, self.rows = fetch_all_rows(self._conn, self.table, sort_info, filter_info)
+        self._total = count_rows(self._conn, self.table, filter_info)
+        self.cols, self.rows = fetch_all_rows(
+            self._conn, self.table, sort_info, filter_info,
+            limit=_PAGE_SIZE, offset=0,
+        )
+        self._offset = len(self.rows)
+        self._all_loaded = self._offset >= self._total
         self._known_rows = set(self.rows)
         self._flasher.clear()
         self._redraw_dt()
-        fi = self._prefs.get_filter(self.table)
-        self.app.sub_title = (
-            f"{self.table}  ({len(self.rows)} rows){filter_caption(fi)} - Enter to observe"
-        )
+        self._update_subtitle()
 
     def action_refresh(self) -> None:
         self._reload()
         self.query_one("#row-table", DataTable).focus()
+
+    def _update_subtitle(self) -> None:
+        fi = self._prefs.get_filter(self.table)
+        loaded = len(self.rows)
+        total = self._total
+        if self._all_loaded or loaded == total:
+            count_tag = f"{loaded} rows"
+        else:
+            count_tag = f"{loaded}/{total} rows"
+        self.app.sub_title = (
+            f"{self.table}  ({count_tag}){filter_caption(fi)} - Enter to observe"
+        )
 
     def action_filter_column(self) -> None:
         dt = self.query_one("#row-table", DataTable)
@@ -213,6 +249,15 @@ class RowPickerScreen(SortableMixin, Screen):
         self.app.push_screen(FilterValueScreen(self.table, col_name, current), on_value)
 
     # ── events ────────────────────────────────────────────────────────────────
+
+    @on(DataTable.CellHighlighted, "#row-table")
+    def on_cell_highlighted(self, event: DataTable.CellHighlighted) -> None:
+        """Load the next page when cursor approaches the last loaded row."""
+        if self._all_loaded or self._is_live:
+            return
+        dt = self.query_one("#row-table", DataTable)
+        if event.coordinate.row >= dt.row_count - 20:
+            self._load_next_page()
 
     @on(DataTable.HeaderSelected, "#row-table")
     def on_header_selected(self, event: DataTable.HeaderSelected) -> None:
@@ -246,6 +291,30 @@ class RowPickerScreen(SortableMixin, Screen):
         open_link_menu(self, self._schema, db_path, self.table, from_col, on_changed)
 
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _load_next_page(self) -> None:
+        """Append the next page of rows to the DataTable."""
+        if self._all_loaded:
+            return
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+        _, new_rows = fetch_all_rows(
+            self._conn, self.table, sort_info, filter_info,
+            limit=_PAGE_SIZE, offset=self._offset,
+        )
+        if not new_rows:
+            self._all_loaded = True
+            return
+        dt = self.query_one("#row-table", DataTable)
+        for row in new_rows:
+            # OFFSET guarantees these are new rows — no need to check _known_rows.
+            # Update _known_rows so live poll doesn't treat them as "new" later.
+            self._known_rows.add(row)
+            self.rows.append(row)
+            dt.add_row(*[fmt(v) for v in row], key=str(row))
+        self._offset += len(new_rows)
+        self._all_loaded = self._offset >= self._total
+        self._update_subtitle()
 
     def _redraw_dt(self) -> None:
         dt = self.query_one("#row-table", DataTable)
