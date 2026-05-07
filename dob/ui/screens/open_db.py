@@ -1,7 +1,12 @@
 """
 dob.ui.screens.open_db
 ~~~~~~~~~~~~~~~~~~~~~~
-OpenDBScreen — entry screen for entering/loading a DB path.
+OpenDBScreen — entry screen for entering/loading a DB path or MySQL DSN.
+
+Supports two modes:
+  • SQLite — enter a local file path (e.g. ``./test.db``)
+  • MySQL  — enter a DSN starting with ``mysql://``
+             (e.g. ``mysql://user:pass@localhost/mydb``)
 """
 
 from __future__ import annotations
@@ -21,9 +26,11 @@ from dob.settings.links import VirtualLinks
 from dob.settings.preferences import UserPreferences
 from dob.ui.screens.table_picker import TablePickerScreen
 
+_MYSQL_SCHEME = "mysql://"
+
 
 class OpenDBScreen(Screen):
-    """Entry screen — enter a path to a SQLite database."""
+    """Entry screen — enter a SQLite path or a MySQL DSN."""
 
     BINDINGS = [Binding("ctrl+q", "app.quit", "Quit", show=True)]
 
@@ -32,12 +39,20 @@ class OpenDBScreen(Screen):
         yield Footer()
         with Vertical(id="open-db-container"):
             yield Static(
-                "[bold cyan]dob[/]\n[dim]SQLite relationship explorer[/dim]",
+                "[bold cyan]dob[/]\n[dim]SQL relationship explorer[/dim]",
                 id="logo",
             )
-            yield Label("Path to SQLite database file:")
-            yield Input(placeholder="e.g. ./test.db", id="db-path-input")
+            yield Label("SQLite path or MySQL DSN:")
+            yield Input(
+                placeholder="e.g. ./test.db  or  mysql://user:pass@host/db",
+                id="db-path-input",
+            )
             yield Label("", id="error-label")
+            yield Static(
+                "[dim]SQLite: enter a file path\n"
+                "MySQL:  mysql://user:pass@host[:port]/database[/dim]",
+                id="hint-label",
+            )
 
     def on_mount(self) -> None:
         inp: Input = self.query_one("#db-path-input")
@@ -54,18 +69,26 @@ class OpenDBScreen(Screen):
     def _try_open(self, path: str) -> None:
         err: Label = self.query_one("#error-label")
         if not path:
-            err.update("[red]Please enter a path.[/red]")
+            err.update("[red]Please enter a path or DSN.[/red]")
             return
-        p = Path(path)
-        if not p.exists():
-            err.update(f"[red]File not found: {path}[/red]")
-            return
+
+        is_mysql = path.startswith(_MYSQL_SCHEME)
+
+        # For SQLite, validate the file exists before trying to connect
+        if not is_mysql:
+            p = Path(path)
+            if not p.exists():
+                err.update(f"[red]File not found: {path}[/red]")
+                return
+
         try:
-            conn = open_connection(p)
+            conn = open_connection(path)
             schema = load_schema(conn)
-            schema.db_path = str(p)
-            VirtualLinks.inject(schema, str(p))
-            prefs = UserPreferences(str(p))
-            self.app.push_screen(TablePickerScreen(conn, schema, prefs, str(p)))
+            # VirtualLinks are only meaningful for SQLite (file-based) databases
+            schema.db_path = str(Path(path)) if not is_mysql else path
+            if not is_mysql:
+                VirtualLinks.inject(schema, str(Path(path)))
+            prefs = UserPreferences(schema.db_path)
+            self.app.push_screen(TablePickerScreen(conn, schema, prefs, path))
         except Exception as exc:
             err.update(f"[red]Error: {exc}[/red]")

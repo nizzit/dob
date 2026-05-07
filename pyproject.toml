@@ -5,6 +5,8 @@ description = "SQL DB graph explorer — observe a record and all its related da
 requires-python = ">=3.13"
 dependencies = [
     "textual>=8.2.5",
+    "pymysql>=1.1",
+    "cryptography>=42",
 ]
 
 [project.scripts]

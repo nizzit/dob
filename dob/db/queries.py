@@ -2,89 +2,135 @@
 dob.db.queries
 ~~~~~~~~~~~~~~
 All SQL read helpers.  No business logic, no settings, no UI.
+
+Supports both SQLite (PRAGMA-based PK detection) and MySQL
+(INFORMATION_SCHEMA-based PK detection).
 """
 
 from __future__ import annotations
 
-import sqlite3
 from typing import Any
 
 
 # ── ordering ──────────────────────────────────────────────────────────────────
 
 
-def order_clause(sort_info: tuple[str, bool] | None) -> str:
+def order_clause(sort_info: tuple[str, bool] | None, conn: Any = None) -> str:
     """Return an ORDER BY clause string (empty if *sort_info* is None)."""
     if not sort_info:
         return ""
-    return f' ORDER BY "{sort_info[0]}" {"DESC" if sort_info[1] else "ASC"}'
+    col = _q(conn, sort_info[0]) if conn is not None else f'"{sort_info[0]}"'
+    return f' ORDER BY {col} {"DESC" if sort_info[1] else "ASC"}'
 
 
 # ── PK helpers ────────────────────────────────────────────────────────────────
 
 
-def get_pk_column(conn: sqlite3.Connection, table: str) -> str | None:
+def get_pk_column(conn: Any, table: str) -> str | None:
     """Return the single PK column name, or None for composite / no PK."""
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info('{table}')")
-    for row in cur.fetchall():
-        if row[5] == 1:
-            return row[1]
+    pks = get_pk_columns(conn, table)
+    if len(pks) == 1:
+        return next(iter(pks))
     return None
 
 
-def get_pk_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+def get_pk_columns(conn: Any, table: str) -> set[str]:
     """Return all PK column names (composite PK support)."""
+    db_type = getattr(conn, "db_type", "sqlite")
+    if db_type == "mysql":
+        return _get_pk_columns_mysql(conn, table)
+    return _get_pk_columns_sqlite(conn, table)
+
+
+def _get_pk_columns_sqlite(conn: Any, table: str) -> set[str]:
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info('{table}')")
     return {row[1] for row in cur.fetchall() if row[5] > 0}
 
 
+def _get_pk_columns_mysql(conn: Any, table: str) -> set[str]:
+    cur = conn.cursor()
+    cur.execute("SELECT DATABASE()")
+    row = cur.fetchone()
+    db_name: str = row[0] if row and row[0] else ""
+
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COLUMN_NAME "
+        "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+        "  AND CONSTRAINT_NAME = 'PRIMARY'",
+        (db_name, table),
+    )
+    return {r[0] for r in cur.fetchall()}
+
+
 # ── row fetchers ──────────────────────────────────────────────────────────────
 
 
+def _placeholder(conn: Any) -> str:
+    """Return the parameter placeholder for this backend."""
+    db_type = getattr(conn, "db_type", "sqlite")
+    return "%s" if db_type == "mysql" else "?"
+
+
+def _q(conn: Any, name: str) -> str:
+    """Quote an identifier for the target backend.
+
+    SQLite accepts both double-quotes and backticks; MySQL only backticks.
+    We use backtick universally — SQLite supports it too.
+    """
+    escaped = name.replace("`", "``")
+    return f"`{escaped}`"
+
+
 def fetch_all_rows(
-    conn: sqlite3.Connection,
+    conn: Any,
     table: str,
     sort_info: tuple[str, bool] | None = None,
     filter_info: tuple[str, Any] | None = None,
 ) -> tuple[list[str], list[tuple]]:
     cur = conn.cursor()
+    ph = _placeholder(conn)
+    qt = _q(conn, table)
     where_sql = ""
     params: list[Any] = []
     if filter_info:
         col, val = filter_info
+        qc = _q(conn, col)
         if val is None:
-            where_sql = f' WHERE "{col}" IS NULL'
+            where_sql = f' WHERE {qc} IS NULL'
         else:
-            where_sql = f' WHERE "{col}" = ?'
+            where_sql = f' WHERE {qc} = {ph}'
             params.append(val)
     cur.execute(
-        f'SELECT * FROM "{table}"{where_sql}{order_clause(sort_info)}', params
+        f'SELECT * FROM {qt}{where_sql}{order_clause(sort_info, conn)}', params
     )
     cols = [d[0] for d in cur.description]
     return cols, cur.fetchall()
 
 
 def fetch_row_by_pk(
-    conn: sqlite3.Connection, table: str, pk_col: str, pk_val: Any
+    conn: Any, table: str, pk_col: str, pk_val: Any
 ) -> tuple[list[str], tuple | None]:
     cur = conn.cursor()
-    cur.execute(f'SELECT * FROM "{table}" WHERE "{pk_col}" = ?', (pk_val,))
+    ph = _placeholder(conn)
+    cur.execute(f'SELECT * FROM {_q(conn, table)} WHERE {_q(conn, pk_col)} = {ph}', (pk_val,))
     cols = [d[0] for d in cur.description]
     return cols, cur.fetchone()
 
 
 def fetch_related_rows(
-    conn: sqlite3.Connection,
+    conn: Any,
     table: str,
     fk_col: str,
     fk_val: Any,
     sort_info: tuple[str, bool] | None = None,
 ) -> tuple[list[str], list[tuple]]:
     cur = conn.cursor()
+    ph = _placeholder(conn)
     cur.execute(
-        f'SELECT * FROM "{table}" WHERE "{fk_col}" = ?{order_clause(sort_info)}',
+        f'SELECT * FROM {_q(conn, table)} WHERE {_q(conn, fk_col)} = {ph}{order_clause(sort_info, conn)}',
         (fk_val,),
     )
     cols = [d[0] for d in cur.description]
@@ -92,7 +138,7 @@ def fetch_related_rows(
 
 
 def fetch_related_rows_in(
-    conn: sqlite3.Connection,
+    conn: Any,
     table: str,
     fk_col: str,
     fk_vals: list[Any],
@@ -104,6 +150,7 @@ def fetch_related_rows_in(
         return [], []
 
     unique_vals = list(dict.fromkeys(vals))
+    ph = _placeholder(conn)
     cur = conn.cursor()
     all_rows: list[tuple] = []
     cols: list[str] = []
@@ -111,9 +158,9 @@ def fetch_related_rows_in(
     chunk_size = 900  # stay below SQLite variable limits
     for i in range(0, len(unique_vals), chunk_size):
         chunk = unique_vals[i : i + chunk_size]
-        placeholders = ",".join("?" for _ in chunk)
+        placeholders = ",".join(ph for _ in chunk)
         cur.execute(
-            f'SELECT * FROM "{table}" WHERE "{fk_col}" IN ({placeholders}){order_clause(sort_info)}',
+            f'SELECT * FROM {_q(conn, table)} WHERE {_q(conn, fk_col)} IN ({placeholders}){order_clause(sort_info, conn)}',
             chunk,
         )
         if not cols:
@@ -127,7 +174,7 @@ def fetch_related_rows_in(
 
 
 def sql_sort_rows(
-    conn: sqlite3.Connection,
+    conn: Any,
     table: str,
     cols: list[str],
     rows: list[tuple],
@@ -142,10 +189,11 @@ def sql_sort_rows(
     try:
         pk_idx = cols.index(pk_col)
         pk_vals = [r[pk_idx] for r in rows]
-        placeholders = ",".join("?" for _ in pk_vals)
+        ph = _placeholder(conn)
+        placeholders = ",".join(ph for _ in pk_vals)
         cur = conn.cursor()
         cur.execute(
-            f'SELECT * FROM "{table}" WHERE "{pk_col}" IN ({placeholders}){order_clause(sort_info)}',
+            f'SELECT * FROM {_q(conn, table)} WHERE {_q(conn, pk_col)} IN ({placeholders}){order_clause(sort_info, conn)}',
             pk_vals,
         )
         res = cur.fetchall()

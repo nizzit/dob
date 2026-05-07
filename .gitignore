@@ -25,3 +25,4 @@ lightrag.*
 # Misc / stray dirs
 list/
 inputs/
+.tasks/

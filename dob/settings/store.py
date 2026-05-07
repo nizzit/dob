@@ -26,7 +26,17 @@ _EMPTY: dict = {"links": [], "sorts": {}, "filters": {}}
 
 
 def _settings_path(db_path: str) -> Path:
-    return Path(db_path).with_suffix(".dob.json")
+    # SQLite: настройки рядом с файлом БД — <name>.dob.json
+    if not db_path.startswith("mysql://"):
+        return Path(db_path).with_suffix(".dob.json")
+    # MySQL: настройки в ~/.config/dob/<md5>.dob.json
+    # md5 берём от DSN без пароля, чтобы файл был предсказуемым
+    import hashlib, re
+    sanitized = re.sub(r'(:)[^@]+(@)', r'\1***\2', db_path)  # скрываем пароль
+    slug = hashlib.md5(sanitized.encode()).hexdigest()[:16]
+    config_dir = Path.home() / ".config" / "dob"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / f"{slug}.dob.json"
 
 
 class ProjectSettings:

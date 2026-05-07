@@ -4,7 +4,7 @@ dob.cli
 Command-line entry point.
 
 Usage:
-    dob [path/to/database.db]
+    dob [path/to/database.db | mysql://user:pass@host/dbname]
 """
 
 from __future__ import annotations
