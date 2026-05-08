@@ -105,3 +105,34 @@ LinkManagerScreen #mgr-hint {
     margin: 1 2 0 2;
     height: 1;
 }
+
+/* ── Connection History Modal ──────────────────────────────────────────── */
+
+ConnectionHistoryScreen {
+    align: center middle;
+}
+
+ConnectionHistoryScreen #ch-title {
+    margin: 0 2 1 2;
+    height: 1;
+}
+
+ConnectionHistoryScreen Input {
+    margin: 1 0;
+    width: 60;
+}
+
+ConnectionHistoryScreen ListView {
+    width: 60;
+    height: 15;
+    border: solid $accent;
+}
+
+ConnectionHistoryScreen .ch-entry {
+    padding: 0 1;
+}
+
+ConnectionHistoryScreen #ch-hint {
+    margin: 1 2 0 2;
+    height: 1;
+}

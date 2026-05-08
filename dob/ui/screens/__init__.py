@@ -1,5 +1,6 @@
 """dob.ui.screens — all Textual screen classes."""
 
+from .connection_history import ConnectionHistoryScreen
 from .db_picker import DbPickerScreen
 from .expanded import ExpandedTableScreen
 from .filter_value import FilterValueScreen
@@ -11,6 +12,7 @@ from .row_picker import RowPickerScreen
 from .table_picker import TablePickerScreen
 
 __all__ = [
+    "ConnectionHistoryScreen",
     "DbPickerScreen",
     "ExpandedTableScreen",
     "FilterValueScreen",

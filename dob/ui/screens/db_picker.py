@@ -18,6 +18,7 @@ from textual.widgets import Footer, Header, Label, ListItem, ListView
 
 from dob.db.connection import open_connection, parse_mysql_dsn
 from dob.db.schema import load_schema
+from dob.settings.connection_history import ConnectionHistory
 from dob.settings.preferences import UserPreferences
 from dob.ui.screens.table_picker import TablePickerScreen
 
@@ -94,6 +95,8 @@ class DbPickerScreen(Screen):
             conn = open_connection(new_dsn)
             schema = load_schema(conn)
             schema.db_path = new_dsn
+            # Record successful connection in history
+            ConnectionHistory().add_or_update(new_dsn, "mysql")
             prefs = UserPreferences(new_dsn)
             self.app.push_screen(
                 TablePickerScreen(conn, schema, prefs, new_dsn)

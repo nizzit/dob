@@ -26,6 +26,7 @@ from dob.db.connection import (
     parse_mysql_dsn,
 )
 from dob.db.schema import load_schema
+from dob.settings.connection_history import ConnectionHistory
 from dob.settings.links import VirtualLinks
 from dob.settings.preferences import UserPreferences
 from dob.ui.screens.db_picker import DbPickerScreen
@@ -102,6 +103,9 @@ class OpenDBScreen(Screen):
         # Normal open (SQLite or MySQL with database)
         try:
             conn = open_connection(path)
+            # Record successful connection in history
+            db_type = "mysql" if is_mysql else "sqlite"
+            ConnectionHistory().add_or_update(path, db_type)
             schema = load_schema(conn)
             # VirtualLinks are only meaningful for SQLite (file-based) databases
             schema.db_path = str(Path(path)) if not is_mysql else path
