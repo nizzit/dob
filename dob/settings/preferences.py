@@ -45,7 +45,7 @@ class UserPreferences:
         if current and current[0] == col:
             new_sort: tuple[str, bool] = (col, not current[1])
         else:
-            new_sort = (col, True)  # first press → descending
+            new_sort = (col, False)  # first press → descending (False = DESC)
         self.sorts[table] = new_sort
         self._settings.patch(sorts=self.sorts)
 

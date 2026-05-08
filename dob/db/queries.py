@@ -20,7 +20,7 @@ def order_clause(sort_info: tuple[str, bool] | None, conn: Any = None) -> str:
     if not sort_info:
         return ""
     col = _q(conn, sort_info[0]) if conn is not None else f'"{sort_info[0]}"'
-    return f' ORDER BY {col} {"DESC" if sort_info[1] else "ASC"}'
+    return f' ORDER BY {col} {"ASC" if sort_info[1] else "DESC"}'
 
 
 # ── PK helpers ────────────────────────────────────────────────────────────────

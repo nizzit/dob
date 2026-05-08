@@ -144,8 +144,8 @@ def test_fetch_all_rows_with_filter(live_conn):
 
 def test_fetch_all_rows_with_sort(live_conn):
     from dob.db.queries import fetch_all_rows
-    _, rows_asc  = fetch_all_rows(live_conn, "_test_orders", sort_info=("total", False))
-    _, rows_desc = fetch_all_rows(live_conn, "_test_orders", sort_info=("total", True))
+    _, rows_asc  = fetch_all_rows(live_conn, "_test_orders", sort_info=("total", True))
+    _, rows_desc = fetch_all_rows(live_conn, "_test_orders", sort_info=("total", False))
     assert rows_asc[0][2] <= rows_asc[-1][2]
     assert rows_desc[0][2] >= rows_desc[-1][2]
 
@@ -191,7 +191,7 @@ def test_get_pk_column(live_conn):
 def test_sql_sort_rows(live_conn):
     from dob.db.queries import fetch_all_rows, sql_sort_rows
     cols, rows = fetch_all_rows(live_conn, "_test_orders")
-    sorted_rows = sql_sort_rows(live_conn, "_test_orders", cols, rows, ("total", True))
+    sorted_rows = sql_sort_rows(live_conn, "_test_orders", cols, rows, ("total", False))
     totals = [r[2] for r in sorted_rows]
     assert totals == sorted(totals, reverse=True)
 
