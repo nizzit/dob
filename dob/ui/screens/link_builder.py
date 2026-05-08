@@ -23,7 +23,7 @@ class LinkBuilderScreen(ModalScreen[bool]):
     Saves via VirtualLinks.add() and dismisses(True) on success.
     """
 
-    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel", show=True)]
+    BINDINGS = [Binding("escape", "escape_pressed", "Cancel", show=True)]
 
     def __init__(
         self,
@@ -103,6 +103,14 @@ class LinkBuilderScreen(ModalScreen[bool]):
                 )
 
         lv.focus()
+
+    def action_escape_pressed(self) -> None:
+        if self._step == 2:
+            self._target_table = None
+            self._step = 1
+            self._render_step()
+        else:
+            self.dismiss(False)
 
     @on(ListView.Selected, "#link-list")
     def item_selected(self, event: ListView.Selected) -> None:
