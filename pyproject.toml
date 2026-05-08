@@ -17,6 +17,12 @@ dev = [
     "pytest>=9.0.3",
 ]
 
+[tool.setuptools.packages.find]
+include = ["dob*"]
+
+[tool.setuptools.package-data]
+dob = ["*.tcss", "**/*.tcss"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
