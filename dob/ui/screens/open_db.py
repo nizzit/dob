@@ -20,10 +20,15 @@ from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Label, Static
 
-from dob.db.connection import open_connection
+from dob.db.connection import (
+    open_connection,
+    open_mysql_bare,
+    parse_mysql_dsn,
+)
 from dob.db.schema import load_schema
 from dob.settings.links import VirtualLinks
 from dob.settings.preferences import UserPreferences
+from dob.ui.screens.db_picker import DbPickerScreen
 from dob.ui.screens.table_picker import TablePickerScreen
 
 _MYSQL_SCHEME = "mysql://"
@@ -81,6 +86,20 @@ class OpenDBScreen(Screen):
                 err.update(f"[red]File not found: {path}[/red]")
                 return
 
+        # MySQL without a database → show picker
+        if is_mysql:
+            creds = parse_mysql_dsn(path)
+            if not creds.database:
+                try:
+                    bare_conn = open_mysql_bare(path)
+                    self.app.push_screen(DbPickerScreen(bare_conn, path))
+                    err.update("")
+                    return
+                except Exception as exc:
+                    err.update(f"[red]Error: {exc}[/red]")
+                    return
+
+        # Normal open (SQLite or MySQL with database)
         try:
             conn = open_connection(path)
             schema = load_schema(conn)
@@ -90,5 +109,6 @@ class OpenDBScreen(Screen):
                 VirtualLinks.inject(schema, str(Path(path)))
             prefs = UserPreferences(schema.db_path)
             self.app.push_screen(TablePickerScreen(conn, schema, prefs, path))
+            err.update("")
         except Exception as exc:
             err.update(f"[red]Error: {exc}[/red]")
