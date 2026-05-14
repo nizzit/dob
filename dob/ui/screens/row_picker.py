@@ -2,6 +2,11 @@
 dob.ui.screens.row_picker
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 RowPickerScreen — pick a row from a table to observe.
+
+All DB I/O runs in background thread workers (@work(thread=True)) so
+the Textual event loop never blocks.  The screen mounts immediately
+with a LoadingIndicator; data is applied via call_from_thread once
+the worker completes.
 """
 
 from __future__ import annotations
@@ -10,11 +15,11 @@ import sqlite3
 from datetime import datetime
 from typing import Any
 
-from textual import on
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label
+from textual.widgets import DataTable, Footer, Header, Label, LoadingIndicator
 
 from dob.db.lookup import LookupCache
 from dob.db.queries import count_rows, fetch_all_rows, get_pk_column
@@ -33,7 +38,6 @@ from dob.ui.widgets.table_block import _build_col_meta
 
 
 # How many rows to load per page (initial + each incremental load).
-# Sized to comfortably fill a typical terminal; more loaded on demand.
 _PAGE_SIZE = 200
 
 
@@ -56,20 +60,15 @@ class RowPickerScreen(SortableMixin, Screen):
         self._prefs = prefs
         self.table = table
         self._lookup = LookupCache(conn)
-        self.pk_col = get_pk_column(conn, table)
+        # These are populated once the first worker finishes
+        self.pk_col: str | None = None
+        self.cols: list[str] = []
+        self.rows: list[tuple] = []
         # Pagination state
         self._offset: int = 0
         self._total: int = 0
         self._all_loaded: bool = False
-        # Fetch first page
-        fi = prefs.get_filter(table)
-        self._total = count_rows(conn, table, fi)
-        self.cols, self.rows = fetch_all_rows(
-            conn, table, filter_info=fi, limit=_PAGE_SIZE, offset=0
-        )
-        self._offset = len(self.rows)
-        self._all_loaded = self._offset >= self._total
-        self._known_rows: set[tuple] = set(self.rows)
+        self._known_rows: set[tuple] = set()
         self._flasher = RowFlasher()
         self._timer = None
         self._is_live = False
@@ -92,33 +91,21 @@ class RowPickerScreen(SortableMixin, Screen):
         yield Header()
         yield Footer()
         yield Label("", id="live-status")
+        yield LoadingIndicator(id="loading")
         pk_cols, fk_cols = _build_col_meta(self._conn, self._schema, self.table)
+        self._pk_cols_meta = pk_cols
+        self._fk_cols_meta = fk_cols
         dt = DataTable(id="row-table", zebra_stripes=True, cursor_type="cell")
-        sort_info = self._prefs.get_sort(self.table)
-        filter_info = self._prefs.get_filter(self.table)
-        # Re-fetch first page with sort applied via SQL (avoids in-memory sort)
-        if sort_info:
-            self.cols, self.rows = fetch_all_rows(
-                self._conn, self.table, sort_info, filter_info,
-                limit=_PAGE_SIZE, offset=0,
-            )
-            self._offset = len(self.rows)
-            self._all_loaded = self._offset >= self._total
-            self._known_rows = set(self.rows)  # sync with what's actually displayed
-        headers = HeaderBuilder(pk_cols, fk_cols, sort_info, filter_info).headers(self.cols)
-        dt.add_columns(*headers)
-        for row in self.rows:
-            dt.add_row(*[fmt(v) for v in row], key=str(row))
+        dt.display = False
         yield dt
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        self._update_subtitle()
         live = getattr(self.app, "is_table_live", lambda t: False)(self.table)
         if live:
-            self._start_live()
-        self.query_one("#row-table", DataTable).focus()
+            self._is_live = True  # flag only; timer started after data loads
+        self._load_data()
 
     def on_screen_resume(self) -> None:
         live = getattr(self.app, "is_table_live", lambda t: False)(self.table)
@@ -131,6 +118,61 @@ class RowPickerScreen(SortableMixin, Screen):
         self.app.sub_title = ""
         if self._timer:
             self._timer.stop()
+
+    # ── background worker ─────────────────────────────────────────────────────
+
+    @work(thread=True, exclusive=True, group="row-load")
+    def _load_data(self) -> None:
+        """Fetch count + first page in a background thread."""
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+        pk_col = get_pk_column(self._conn, self.table)
+        total = count_rows(self._conn, self.table, filter_info)
+        cols, rows = fetch_all_rows(
+            self._conn, self.table, sort_info, filter_info,
+            limit=_PAGE_SIZE, offset=0,
+        )
+        self.app.call_from_thread(self._apply_data, pk_col, cols, rows, total)
+
+    def _apply_data(
+        self,
+        pk_col: str | None,
+        cols: list[str],
+        rows: list[tuple],
+        total: int,
+    ) -> None:
+        """Apply fetched data to the UI (runs on the main thread)."""
+        self.pk_col = pk_col
+        self.cols = cols
+        self.rows = rows
+        self._total = total
+        self._offset = len(rows)
+        self._all_loaded = self._offset >= total
+        self._known_rows = set(rows)
+        self._flasher.clear()
+
+        sort_info = self._prefs.get_sort(self.table)
+        filter_info = self._prefs.get_filter(self.table)
+
+        dt = self.query_one("#row-table", DataTable)
+        dt.clear(columns=True)
+        headers = HeaderBuilder(
+            self._pk_cols_meta, self._fk_cols_meta, sort_info, filter_info
+        ).headers(cols)
+        dt.add_columns(*headers)
+        for row in rows:
+            dt.add_row(*[fmt(v) for v in row], key=str(row))
+
+        # Hide spinner, show table
+        self.query_one("#loading", LoadingIndicator).display = False
+        dt.display = True
+        dt.focus()
+
+        self._update_subtitle()
+
+        # Start live timer now if live mode was requested before data arrived
+        if self._is_live and self._timer is None:
+            self._start_live()
 
     # ── live ─────────────────────────────────────────────────────────────────
 
@@ -145,7 +187,7 @@ class RowPickerScreen(SortableMixin, Screen):
 
     def _start_live(self) -> None:
         self._is_live = True
-        self._timer = self.set_interval(LIVE_INTERVAL, self._live_poll)
+        self._timer = self.set_interval(LIVE_INTERVAL, self._live_poll_dispatch)
         self._update_live_label()
 
     def _stop_live(self) -> None:
@@ -162,27 +204,35 @@ class RowPickerScreen(SortableMixin, Screen):
         except Exception:
             pass
 
-    def _live_poll(self) -> None:
+    def _live_poll_dispatch(self) -> None:
+        """Timer callback — dispatches DB fetch to a worker thread."""
+        self._live_poll_worker()
+
+    @work(thread=True, group="row-live-poll")
+    def _live_poll_worker(self) -> None:
         sort_info = self._prefs.get_sort(self.table)
         filter_info = self._prefs.get_filter(self.table)
-        # Fetch everything — live mode must see all rows, not just a page
         _, all_rows = fetch_all_rows(self._conn, self.table, sort_info, filter_info)
-        # Compare against the full known set (which may be only a first page).
-        # Anything not yet in _known_rows is either truly new or was beyond the
-        # loaded page — either way we add it to the table.
+        self.app.call_from_thread(self._apply_live_poll, all_rows)
+
+    def _apply_live_poll(self, all_rows: list[tuple]) -> None:
+        """Apply live-poll results on the main thread."""
         new_rows = [r for r in all_rows if r not in self._known_rows]
         if new_rows:
             for row in new_rows:
                 self._known_rows.add(row)
                 self._flasher.add(str(row))
-            # Rebuild full row list: keep loaded order + append new at end
-            self.rows = list(all_rows)  # switch to full sorted list from DB
+            self.rows = list(all_rows)
             self._offset = len(all_rows)
             self._total = len(all_rows)
             self._all_loaded = True
             self._redraw_dt()
             self._update_subtitle()
-        self._flasher.tick(self.query_one("#row-table", DataTable))
+        try:
+            dt = self.query_one("#row-table", DataTable)
+            self._flasher.tick(dt)
+        except Exception:
+            pass
         ts = datetime.now().strftime("%H:%M:%S")
         n_new = len(new_rows)
         new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
@@ -191,23 +241,18 @@ class RowPickerScreen(SortableMixin, Screen):
     # ── reload / refresh ─────────────────────────────────────────────────────
 
     def _reload(self) -> None:
-        sort_info = self._prefs.get_sort(self.table)
-        filter_info = self._prefs.get_filter(self.table)
-        self._total = count_rows(self._conn, self.table, filter_info)
-        self.cols, self.rows = fetch_all_rows(
-            self._conn, self.table, sort_info, filter_info,
-            limit=_PAGE_SIZE, offset=0,
-        )
-        self._offset = len(self.rows)
-        self._all_loaded = self._offset >= self._total
-        self._known_rows = set(self.rows)
-        self._flasher.clear()
-        self._redraw_dt()
-        self._update_subtitle()
+        """Trigger a background reload (cancels any in-flight load via exclusive group)."""
+        try:
+            loading = self.query_one("#loading", LoadingIndicator)
+            loading.display = True
+            dt = self.query_one("#row-table", DataTable)
+            dt.display = False
+        except Exception:
+            pass
+        self._load_data()
 
     def action_refresh(self) -> None:
         self._reload()
-        self.query_one("#row-table", DataTable).focus()
 
     def _update_subtitle(self) -> None:
         fi = self._prefs.get_filter(self.table)
@@ -244,7 +289,10 @@ class RowPickerScreen(SortableMixin, Screen):
                     f"Filter set: {self.table}.{col_name} = {fmt(value)}", title="Filter"
                 )
             self._reload()
-            self.query_one("#row-table", DataTable).focus()
+            try:
+                self.query_one("#row-table", DataTable).focus()
+            except Exception:
+                pass
 
         self.app.push_screen(FilterValueScreen(self.table, col_name, current), on_value)
 
@@ -307,8 +355,6 @@ class RowPickerScreen(SortableMixin, Screen):
             return
         dt = self.query_one("#row-table", DataTable)
         for row in new_rows:
-            # OFFSET guarantees these are new rows — no need to check _known_rows.
-            # Update _known_rows so live poll doesn't treat them as "new" later.
             self._known_rows.add(row)
             self.rows.append(row)
             dt.add_row(*[fmt(v) for v in row], key=str(row))
@@ -320,10 +366,11 @@ class RowPickerScreen(SortableMixin, Screen):
         dt = self.query_one("#row-table", DataTable)
         cur_r, cur_c = dt.cursor_row, dt.cursor_column
         dt.clear(columns=True)
-        pk_cols, fk_cols = _build_col_meta(self._conn, self._schema, self.table)
         sort_info = self._prefs.get_sort(self.table)
         filter_info = self._prefs.get_filter(self.table)
-        headers = HeaderBuilder(pk_cols, fk_cols, sort_info, filter_info).headers(self.cols)
+        headers = HeaderBuilder(
+            self._pk_cols_meta, self._fk_cols_meta, sort_info, filter_info
+        ).headers(self.cols)
         dt.add_columns(*headers)
         for row in self.rows:
             key = str(row)

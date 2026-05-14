@@ -10,7 +10,7 @@ import sqlite3
 from datetime import datetime
 from typing import Any
 
-from textual import on
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen
@@ -118,6 +118,8 @@ class ExpandedTableScreen(SortableMixin, ModalScreen):
     def on_unmount(self) -> None:
         if self._timer:
             self._timer.stop()
+        # Cancel any in-flight poll worker
+        self.workers.cancel_group(self, "expanded-live-poll")
 
     # ── live ─────────────────────────────────────────────────────────────────
 
@@ -153,6 +155,12 @@ class ExpandedTableScreen(SortableMixin, ModalScreen):
             pass
 
     def _poll(self) -> None:
+        """Timer callback — dispatches the blocking fetch to a worker thread."""
+        self._poll_worker()
+
+    @work(thread=True, group="expanded-live-poll")
+    def _poll_worker(self) -> None:
+        """Fetch data in a background thread; apply updates on main thread."""
         if self._conn is None or self._tbl_name is None:
             return
         try:
@@ -170,7 +178,10 @@ class ExpandedTableScreen(SortableMixin, ModalScreen):
                 _, all_rows = fetch_all_rows(self._conn, self._tbl_name, sort_info)
         except Exception:
             return
+        self.app.call_from_thread(self._apply_poll, all_rows)
 
+    def _apply_poll(self, all_rows: list[tuple]) -> None:
+        """Apply poll results on the main thread."""
         new_rows = [r for r in all_rows if r not in self._known_rows]
         if new_rows:
             for row in new_rows:
@@ -180,7 +191,10 @@ class ExpandedTableScreen(SortableMixin, ModalScreen):
             self._redraw_dt()
             self._refresh_title()
 
-        self._flasher.tick(self.query_one("#expanded-dt", DataTable))
+        try:
+            self._flasher.tick(self.query_one("#expanded-dt", DataTable))
+        except Exception:
+            pass
 
         ts = datetime.now().strftime("%H:%M:%S")
         n_new = len(new_rows)

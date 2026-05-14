@@ -3,14 +3,15 @@ dob.ui.live_poller
 ~~~~~~~~~~~~~~~~~~
 LivePoller — reusable helper that encapsulates the live-polling loop.
 
-Replaces three nearly-identical poll implementations in:
-  ObservationScreen, ExpandedTableScreen, RowPickerScreen.
+The fetch callback runs in a background thread worker so the Textual
+event loop never blocks on a DB query.  The `on_new` UI-update callback
+is invoked via `call_from_thread` on the main thread.
 
 Usage
 -----
 Each screen creates a LivePoller, passing a fetch callback and a UI
-update callback.  The poller manages the Textual timer and calls the
-callbacks on each tick.
+update callback.  The poller manages the Textual timer and dispatches
+the fetch to a thread.
 
     class MyScreen(Screen):
         def __init__(self, ...):
@@ -19,8 +20,8 @@ callbacks on each tick.
         def action_toggle_live(self) -> None:
             self._poller.toggle()
 
-        def _fetch_rows(self) -> list[tuple]: ...   # return all current rows
-        def _on_new_rows(self, new_rows, all_rows, ts): ...  # update UI
+        def _fetch_rows(self) -> tuple[list[str], list[tuple]]: ...
+        def _on_new_rows(self, new_rows, all_rows): ...
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from typing import Any, Callable
 
 from textual.timer import Timer
 from textual.widgets import Label
+from textual.worker import Worker
 
 LIVE_INTERVAL = 2.0  # seconds between polls
 
@@ -51,12 +53,15 @@ class LivePoller:
     """
     Encapsulates live polling: timer lifecycle, new-row detection, label update.
 
+    The `_fetch_all` callback runs in a background thread; `_on_new` is
+    called via `call_from_thread` on the main Textual event loop thread.
+
     Parameters
     ----------
-    owner       Textual widget/screen that owns the timer (for set_interval).
-    fetch_all   Callable returning (cols, all_rows) – pure DB read, no side effects.
-    on_new      Callable(new_rows, all_rows) called when new rows are detected.
-    live_label_id  CSS id of the Label widget to update (default "#live-status").
+    owner           Textual widget/screen that owns the timer.
+    fetch_all       Callable() → (cols, all_rows).  Runs in a thread.
+    on_new          Callable(new_rows, all_rows).  Runs on the main thread.
+    live_label_id   CSS id of the Label widget to update.
     """
 
     def __init__(
@@ -71,6 +76,7 @@ class LivePoller:
         self._on_new = on_new
         self._label_id = live_label_id
         self._timer: Timer | None = None
+        self._worker: Worker | None = None
         self._known: set[tuple] = set()
         self.is_live: bool = False
 
@@ -92,6 +98,7 @@ class LivePoller:
             if self._timer:
                 self._timer.stop()
                 self._timer = None
+            self._cancel_worker()
         self._update_label()
 
     def toggle(self) -> None:
@@ -101,14 +108,25 @@ class LivePoller:
             self.start()
 
     def dispose(self) -> None:
-        """Call from on_unmount to cancel the timer."""
+        """Call from on_unmount to cancel the timer and any running worker."""
         if self._timer:
             self._timer.stop()
             self._timer = None
+        self._cancel_worker()
 
     # ── poll ──────────────────────────────────────────────────────────────────
 
     def _poll(self) -> None:
+        """Timer callback (runs on event loop) — dispatches fetch to a thread."""
+        self._worker = self._owner.run_worker(
+            self._fetch_and_notify,
+            thread=True,
+            group="live-poller",
+            exclusive=False,
+        )
+
+    def _fetch_and_notify(self) -> None:
+        """Runs in a worker thread — fetches data, then posts results back."""
         try:
             _cols, all_rows = self._fetch_all()
         except Exception:
@@ -118,16 +136,34 @@ class LivePoller:
         if new_rows:
             for r in new_rows:
                 self._known.add(r)
-            self._on_new(new_rows, all_rows)
 
         ts = datetime.now().strftime("%H:%M:%S")
         n_new = len(new_rows)
         new_tag = f"  [bold green]+{n_new} rows[/]" if n_new else ""
-        self._update_label(
-            f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
-        )
+        label_extra = f"  [dim]last poll {ts}{new_tag} - press L to stop[/dim]"
 
-    # ── label ─────────────────────────────────────────────────────────────────
+        self._owner.app.call_from_thread(self._deliver, new_rows, all_rows, label_extra)
+
+    def _deliver(
+        self,
+        new_rows: list[tuple],
+        all_rows: list[tuple],
+        label_extra: str,
+    ) -> None:
+        """Called on the main thread — updates UI if there are new rows."""
+        if new_rows:
+            self._on_new(new_rows, all_rows)
+        self._update_label(label_extra)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _cancel_worker(self) -> None:
+        """Cancel the active fetch worker if one is running."""
+        try:
+            self._owner.workers.cancel_group(self._owner, "live-poller")
+        except Exception:
+            pass
+        self._worker = None
 
     def _update_label(self, extra: str = "") -> None:
         try:

@@ -2,6 +2,10 @@
 dob.ui.screens.observation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 ObservationScreen — shows all rows related to a seed row.
+
+All DB I/O (build_observation / BFS traversal) runs in a background
+thread worker.  The screen mounts immediately with a LoadingIndicator;
+TableBlock widgets are mounted once the worker result arrives.
 """
 
 from __future__ import annotations
@@ -9,16 +13,17 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from textual import on
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label
+from textual.widgets import DataTable, Footer, Header, Label, LoadingIndicator
 
 from dob.db.lookup import LookupCache
 from dob.db.schema import Schema
 from dob.domain.diff import diff_observations
+from dob.domain.observation import Observation
 from dob.domain.traversal import build_observation
 from dob.settings.preferences import UserPreferences
 from dob.ui.drilldown import open_observation_for_row
@@ -57,9 +62,13 @@ class ObservationScreen(SortableMixin, Screen):
         self._pk_val = pk_val
         self._lookup = LookupCache(conn)
 
-        self._obs = build_observation(conn, schema, prefs, table, pk_col, pk_val, self._lookup)
+        # Populated once the load worker completes
+        self._obs: Observation | None = None
         self._blocks: dict[str, TableBlock] = {}
+        # Use a lightweight fetch stub — actual polling goes through
+        # _live_poll_worker (async) instead of the default LivePoller path.
         self._poller = LivePoller(self, self._fetch_rows, self._on_new_rows)
+        self._poller._poll = self._poll_dispatch  # type: ignore[method-assign]
 
     # ── SortableMixin interface ───────────────────────────────────────────────
 
@@ -82,48 +91,9 @@ class ObservationScreen(SortableMixin, Screen):
         yield Header()
         yield Footer()
         yield Label("", id="live-status")
+        yield LoadingIndicator(id="loading")
         with VerticalScroll(id="obs-scroll"):
-            obs = self._obs
-
-            _pk, _fk = _build_col_meta(self._conn, self._schema, obs.seed_table)
-            blk = TableBlock(
-                table=obs.seed_table,
-                cols=obs.seed_cols,
-                rows=[obs.seed_row] if obs.seed_row else [],
-                is_seed=True,
-                pk_cols=_pk,
-                fk_cols=_fk,
-                schema=self._schema,
-                prefs=self._prefs,
-                lookup=self._lookup,
-                id="block-seed",
-                classes="obs-block",
-            )
-            self._blocks["seed"] = blk
-            yield blk
-
-            if not obs.related:
-                yield Label("[dim]No related records found.[/dim]")
-            else:
-                for tbl_name, (cols, rows) in obs.related.items():
-                    _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
-                    blk = TableBlock(
-                        table=tbl_name,
-                        cols=cols,
-                        rows=rows,
-                        is_seed=False,
-                        pk_cols=_pk,
-                        fk_cols=_fk,
-                        schema=self._schema,
-                        prefs=self._prefs,
-                        lookup=self._lookup,
-                        relation_kind=obs.related_kind.get(tbl_name, ""),
-                        relation_via=obs.related_via.get(tbl_name, set()),
-                        id=f"block-{tbl_name}",
-                        classes="obs-block",
-                    )
-                    self._blocks[tbl_name] = blk
-                    yield blk
+            pass  # blocks mounted dynamically after worker completes
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -131,7 +101,7 @@ class ObservationScreen(SortableMixin, Screen):
         live = getattr(self.app, "is_table_live", lambda t: False)(self._table)
         if live:
             self._poller.start()
-        self.query_one("#obs-scroll").focus()
+        self._load_observation()
 
     def on_screen_resume(self) -> None:
         live = getattr(self.app, "is_table_live", lambda t: False)(self._table)
@@ -143,6 +113,71 @@ class ObservationScreen(SortableMixin, Screen):
     def on_unmount(self) -> None:
         self._poller.dispose()
 
+    # ── background worker ─────────────────────────────────────────────────────
+
+    @work(thread=True, exclusive=True, group="obs-load")
+    def _load_observation(self) -> None:
+        """Run build_observation in a background thread."""
+        obs = build_observation(
+            self._conn, self._schema, self._prefs,
+            self._table, self._pk_col, self._pk_val, self._lookup,
+        )
+        self.app.call_from_thread(self._apply_observation, obs)
+
+    def _apply_observation(self, obs: Observation) -> None:
+        """Mount all TableBlock widgets on the main thread."""
+        self._obs = obs
+
+        # Hide spinner
+        try:
+            self.query_one("#loading", LoadingIndicator).display = False
+        except Exception:
+            pass
+
+        scroll: VerticalScroll = self.query_one("#obs-scroll")
+
+        _pk, _fk = _build_col_meta(self._conn, self._schema, obs.seed_table)
+        blk = TableBlock(
+            table=obs.seed_table,
+            cols=obs.seed_cols,
+            rows=[obs.seed_row] if obs.seed_row else [],
+            is_seed=True,
+            pk_cols=_pk,
+            fk_cols=_fk,
+            schema=self._schema,
+            prefs=self._prefs,
+            lookup=self._lookup,
+            id="block-seed",
+            classes="obs-block",
+        )
+        self._blocks["seed"] = blk
+        scroll.mount(blk)
+
+        if not obs.related:
+            scroll.mount(Label("[dim]No related records found.[/dim]"))
+        else:
+            for tbl_name, (cols, rows) in obs.related.items():
+                _pk, _fk = _build_col_meta(self._conn, self._schema, tbl_name)
+                blk = TableBlock(
+                    table=tbl_name,
+                    cols=cols,
+                    rows=rows,
+                    is_seed=False,
+                    pk_cols=_pk,
+                    fk_cols=_fk,
+                    schema=self._schema,
+                    prefs=self._prefs,
+                    lookup=self._lookup,
+                    relation_kind=obs.related_kind.get(tbl_name, ""),
+                    relation_via=obs.related_via.get(tbl_name, set()),
+                    id=f"block-{tbl_name}",
+                    classes="obs-block",
+                )
+                self._blocks[tbl_name] = blk
+                scroll.mount(blk)
+
+        scroll.focus()
+
     # ── live ─────────────────────────────────────────────────────────────────
 
     def action_toggle_live(self) -> None:
@@ -152,27 +187,36 @@ class ObservationScreen(SortableMixin, Screen):
             setter(self._table, self._poller.is_live)
 
     def _fetch_rows(self) -> tuple[list[str], list[tuple]]:
-        new_obs = build_observation(
-            self._conn, self._schema, self._prefs,
-            self._table, self._pk_col, self._pk_val, self._lookup,
-        )
-        # Return seed row list as "rows" — poller doesn't use it directly,
-        # we handle diff ourselves in _on_new_rows.
+        # Stub — not used; actual polling goes through _poll_dispatch → _live_poll_worker
+        if self._obs is None:
+            return [], []
         return self._obs.seed_cols, [self._obs.seed_row] if self._obs.seed_row else []
 
     def _on_new_rows(self, new_rows: list[tuple], all_rows: list[tuple]) -> None:
-        pass  # we override the whole poll logic below
+        pass  # not called — overridden via _poll_dispatch
 
-    # ── poll (custom — uses diff_observations) ────────────────────────────────
+    def _poll_dispatch(self) -> None:
+        """Replaces LivePoller._poll — dispatches async worker instead of blocking."""
+        self._live_poll_worker()
 
-    def _poll_custom(self) -> None:
-        """Called by the poller timer; we bypass the default fetch loop."""
+    # ── live poll (custom — async via worker) ────────────────────────────────
+
+    @work(thread=True, group="obs-live-poll")
+    def _live_poll_worker(self) -> None:
+        """Run build_observation in a thread; apply diffs on main thread."""
         try:
             new_obs = build_observation(
                 self._conn, self._schema, self._prefs,
                 self._table, self._pk_col, self._pk_val, self._lookup,
             )
         except Exception:
+            return
+        self.app.call_from_thread(self._apply_live_diff, new_obs)
+
+    def _apply_live_diff(self, new_obs: Observation) -> None:
+        """Apply observation diffs on the main thread."""
+        if self._obs is None:
+            self._apply_observation(new_obs)
             return
 
         diffs = diff_observations(self._obs, new_obs)
@@ -214,6 +258,16 @@ class ObservationScreen(SortableMixin, Screen):
             blk.tick_flash()
 
         self._obs = new_obs
+
+    # ── reload ────────────────────────────────────────────────────────────────
+
+    def _reload(self) -> None:
+        """Re-run build_observation (exclusive group cancels any in-flight load)."""
+        try:
+            self.query_one("#loading", LoadingIndicator).display = True
+        except Exception:
+            pass
+        self._load_observation()
 
     # ── events ────────────────────────────────────────────────────────────────
 
@@ -296,27 +350,12 @@ class ObservationScreen(SortableMixin, Screen):
         if db_path:
             VirtualLinks.inject(self._schema, db_path)
         self._lookup.invalidate()
-        self._obs = build_observation(
-            self._conn, self._schema, self._prefs,
-            self._table, self._pk_col, self._pk_val, self._lookup,
-        )
-        self._rebuild_blocks()
-
-    def _reload(self) -> None:
-        self._obs = build_observation(
-            self._conn, self._schema, self._prefs,
-            self._table, self._pk_col, self._pk_val, self._lookup,
-        )
-        for bid, blk in self._blocks.items():
-            real_tbl = blk.tbl_name
-            if real_tbl == self._obs.seed_table:
-                blk.update_rows([self._obs.seed_row] if self._obs.seed_row else [])
-            elif real_tbl in self._obs.related:
-                blk.set_relation_kind(self._obs.related_kind.get(real_tbl, ""))
-                blk.set_relation_via(self._obs.related_via.get(real_tbl, set()))
-                blk.update_rows(self._obs.related[real_tbl][1])
+        self._reload()
 
     def _rebuild_blocks(self) -> None:
+        """Full UI rebuild from current self._obs (called after reload completes)."""
+        if self._obs is None:
+            return
         scroll: VerticalScroll = self.query_one("#obs-scroll")
         obs = self._obs
 
