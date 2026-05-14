@@ -125,15 +125,20 @@ class ObservationScreen(SortableMixin, Screen):
         self.app.call_from_thread(self._apply_observation, obs)
 
     def _apply_observation(self, obs: Observation) -> None:
-        """Mount all TableBlock widgets on the main thread."""
-        self._obs = obs
-
+        """Mount or update all TableBlock widgets on the main thread."""
         # Hide spinner
         try:
             self.query_one("#loading", LoadingIndicator).display = False
         except Exception:
             pass
 
+        # If blocks are already mounted, just update them in-place.
+        if self._blocks:
+            self._obs = obs
+            self._rebuild_blocks()
+            return
+
+        self._obs = obs
         scroll: VerticalScroll = self.query_one("#obs-scroll")
 
         _pk, _fk = _build_col_meta(self._conn, self._schema, obs.seed_table)
