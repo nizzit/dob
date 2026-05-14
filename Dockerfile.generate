@@ -1,0 +1,9 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir pymysql cryptography
+
+COPY dob/tools/generate_testdb_mysql.py .
+
+ENTRYPOINT ["python", "-u", "generate_testdb_mysql.py"]

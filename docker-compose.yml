@@ -1,0 +1,50 @@
+services:
+
+  mysql:
+    image: mysql:8.4
+    container_name: dob-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: testshop
+    # НЕ пробрасываем порт наружу — только toxiproxy имеет доступ
+    networks:
+      - dob
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-psecret", "--silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  generate:
+    build:
+      context: .
+      dockerfile: Dockerfile.generate
+    container_name: dob-generate
+    # Подключаемся через toxiproxy — чтобы задержки влияли и на генератор
+    command: ["mysql://root:secret@toxiproxy:3307/testshop", "--interval", "0.5"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+    networks:
+      - dob
+    restart: on-failure
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: dob-toxiproxy
+    ports:
+      - "3307:3307"   # MySQL через прокси (основной DSN)
+      - "8474:8474"   # toxiproxy HTTP API
+    depends_on:
+      - mysql
+    networks:
+      - dob
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy.json:ro
+    command: ["-host", "0.0.0.0", "-config", "/etc/toxiproxy.json"]
+
+networks:
+  dob:
+    driver: bridge

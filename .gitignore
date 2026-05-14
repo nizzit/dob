@@ -15,14 +15,11 @@ wheels/
 *.db-wal
 *.db-journal
 
-# RAG
-rag_storage/
-lightrag.*
-
 # Config
 *.dob.json
 
-# Misc / stray dirs
-list/
-inputs/
+#AI
 .tasks/
+.opencode/
+.pi/
+openspec/
