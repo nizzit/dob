@@ -20,6 +20,7 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, LoadingIndicator
 
+from dob.db.backend import close_thread_conn, thread_conn
 from dob.db.lookup import LookupCache
 from dob.db.schema import Schema
 from dob.domain.diff import diff_observations
@@ -117,11 +118,16 @@ class ObservationScreen(SortableMixin, Screen):
 
     @work(thread=True, exclusive=True, group="obs-load")
     def _load_observation(self) -> None:
-        """Run build_observation in a background thread."""
-        obs = build_observation(
-            self._conn, self._schema, self._prefs,
-            self._table, self._pk_col, self._pk_val, self._lookup,
-        )
+        """Run build_observation in a background thread (private connection)."""
+        conn = thread_conn(self._conn)
+        try:
+            lookup = LookupCache(conn)
+            obs = build_observation(
+                conn, self._schema, self._prefs,
+                self._table, self._pk_col, self._pk_val, lookup,
+            )
+        finally:
+            close_thread_conn(conn, self._conn)
         self.app.call_from_thread(self._apply_observation, obs)
 
     def _apply_observation(self, obs: Observation) -> None:
@@ -208,14 +214,18 @@ class ObservationScreen(SortableMixin, Screen):
 
     @work(thread=True, group="obs-live-poll")
     def _live_poll_worker(self) -> None:
-        """Run build_observation in a thread; apply diffs on main thread."""
+        """Run build_observation in a thread (private connection)."""
+        conn = thread_conn(self._conn)
         try:
+            lookup = LookupCache(conn)
             new_obs = build_observation(
-                self._conn, self._schema, self._prefs,
-                self._table, self._pk_col, self._pk_val, self._lookup,
+                conn, self._schema, self._prefs,
+                self._table, self._pk_col, self._pk_val, lookup,
             )
         except Exception:
             return
+        finally:
+            close_thread_conn(conn, self._conn)
         self.app.call_from_thread(self._apply_live_diff, new_obs)
 
     def _apply_live_diff(self, new_obs: Observation) -> None:

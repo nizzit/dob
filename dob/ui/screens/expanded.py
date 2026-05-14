@@ -16,6 +16,7 @@ from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Label
 
+from dob.db.backend import close_thread_conn, thread_conn
 from dob.db.lookup import LookupCache
 from dob.db.queries import fetch_all_rows, sql_sort_rows
 from dob.db.schema import FKInfo, Schema
@@ -160,13 +161,14 @@ class ExpandedTableScreen(SortableMixin, ModalScreen):
 
     @work(thread=True, group="expanded-live-poll")
     def _poll_worker(self) -> None:
-        """Fetch data in a background thread; apply updates on main thread."""
+        """Fetch data in a background thread (private connection)."""
         if self._conn is None or self._tbl_name is None:
             return
+        conn = thread_conn(self._conn)
         try:
             if self._seed_table and self._seed_pk_col and self._seed_pk_val is not None:
                 new_obs = build_observation(
-                    self._conn, self._schema, self._prefs,
+                    conn, self._schema, self._prefs,
                     self._seed_table, self._seed_pk_col, self._seed_pk_val,
                 )
                 all_rows = (
@@ -175,9 +177,11 @@ class ExpandedTableScreen(SortableMixin, ModalScreen):
                 )
             else:
                 sort_info = self._prefs.get_sort(self._tbl_name) if self._prefs else None
-                _, all_rows = fetch_all_rows(self._conn, self._tbl_name, sort_info)
+                _, all_rows = fetch_all_rows(conn, self._tbl_name, sort_info)
         except Exception:
             return
+        finally:
+            close_thread_conn(conn, self._conn)
         self.app.call_from_thread(self._apply_poll, all_rows)
 
     def _apply_poll(self, all_rows: list[tuple]) -> None:

@@ -21,6 +21,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, LoadingIndicator
 
+from dob.db.backend import close_thread_conn, thread_conn
 from dob.db.lookup import LookupCache
 from dob.db.queries import count_rows, fetch_all_rows, get_pk_column
 from dob.db.schema import Schema
@@ -123,15 +124,19 @@ class RowPickerScreen(SortableMixin, Screen):
 
     @work(thread=True, exclusive=True, group="row-load")
     def _load_data(self) -> None:
-        """Fetch count + first page in a background thread."""
-        sort_info = self._prefs.get_sort(self.table)
-        filter_info = self._prefs.get_filter(self.table)
-        pk_col = get_pk_column(self._conn, self.table)
-        total = count_rows(self._conn, self.table, filter_info)
-        cols, rows = fetch_all_rows(
-            self._conn, self.table, sort_info, filter_info,
-            limit=_PAGE_SIZE, offset=0,
-        )
+        """Fetch count + first page in a background thread (private connection)."""
+        conn = thread_conn(self._conn)
+        try:
+            sort_info = self._prefs.get_sort(self.table)
+            filter_info = self._prefs.get_filter(self.table)
+            pk_col = get_pk_column(conn, self.table)
+            total = count_rows(conn, self.table, filter_info)
+            cols, rows = fetch_all_rows(
+                conn, self.table, sort_info, filter_info,
+                limit=_PAGE_SIZE, offset=0,
+            )
+        finally:
+            close_thread_conn(conn, self._conn)
         self.app.call_from_thread(self._apply_data, pk_col, cols, rows, total)
 
     def _apply_data(
@@ -210,9 +215,13 @@ class RowPickerScreen(SortableMixin, Screen):
 
     @work(thread=True, group="row-live-poll")
     def _live_poll_worker(self) -> None:
-        sort_info = self._prefs.get_sort(self.table)
-        filter_info = self._prefs.get_filter(self.table)
-        _, all_rows = fetch_all_rows(self._conn, self.table, sort_info, filter_info)
+        conn = thread_conn(self._conn)
+        try:
+            sort_info = self._prefs.get_sort(self.table)
+            filter_info = self._prefs.get_filter(self.table)
+            _, all_rows = fetch_all_rows(conn, self.table, sort_info, filter_info)
+        finally:
+            close_thread_conn(conn, self._conn)
         self.app.call_from_thread(self._apply_live_poll, all_rows)
 
     def _apply_live_poll(self, all_rows: list[tuple]) -> None:

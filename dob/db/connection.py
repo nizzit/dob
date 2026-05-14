@@ -151,7 +151,7 @@ def _open_mysql(dsn: str) -> MysqlBackend:
             "Install it with: pip install pymysql"
         ) from exc
 
-    raw = pymysql.connect(
+    connect_kwargs = dict(
         host=creds.host,
         port=creds.port,
         user=creds.user,
@@ -161,7 +161,8 @@ def _open_mysql(dsn: str) -> MysqlBackend:
         cursorclass=pymysql.cursors.Cursor,
         autocommit=True,
     )
-    return MysqlBackend(raw)
+    raw = pymysql.connect(**connect_kwargs)
+    return MysqlBackend(raw, _connect_kwargs=connect_kwargs)
 
 
 def open_mysql_bare(dsn: str) -> MysqlBackend:
